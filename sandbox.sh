@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_NAME=$(basename "$0")
-readonly SCRIPT_NAME
+readonly SCRIPT_NAME=$(basename "$0")
 
 # ==============================================================================
 # UNIFIED IDENTITY-BASED SECURE WORKSPACE MANAGER (ARCH SAFE)
@@ -23,12 +22,14 @@ NS_NAME=""
 VETH_HOST=""
 NS_CREATED=false
 VETH_CREATED=false
+LOCK_FD=""
 
 # Global Flags / Configs
 VERBOSE_ENABLED=false
 TRACE_ENABLED=false
 DRY_RUN=false
 DNS_SERVER="1.1.1.1"
+TIMEOUT=0
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 verbose() {
@@ -41,22 +42,47 @@ error() {
     exit 1
 }
 
+kill_if_set() {
+    local pid="${1:-}" use_sudo="${2:-false}"
+    if [ -n "$pid" ]; then
+        if [ "$use_sudo" = true ]; then
+            sudo kill "$pid" 2>/dev/null || true
+        else
+            kill "$pid" 2>/dev/null || true
+        fi
+    fi
+}
+
 cleanup() {
+    local had_state=false
     if [ "$NS_CREATED" = true ] || [ "$VETH_CREATED" = true ] || [ -n "${TUN_PID:-}" ] || [ -n "${PROFILE_PATH:-}" ]; then
+        had_state=true
         if [ -n "${IDENTITY:-}" ]; then
             log "Saving state and cleaning up identity [$IDENTITY]..."
         else
             log "Saving state and cleaning up sandbox resources..."
         fi
     fi
-    [ -n "${TUN_PID:-}" ] && sudo kill "$TUN_PID" 2> /dev/null || true
-    [ -n "${SOCAT_PID:-}" ] && kill "$SOCAT_PID" 2> /dev/null || true
-    [ -n "${DNS_PID:-}" ] && kill "$DNS_PID" 2> /dev/null || true
-    [ "$NS_CREATED" = true ] && [ -n "${NS_NAME:-}" ] && sudo ip netns delete "$NS_NAME" 2> /dev/null || true
-    [ "$VETH_CREATED" = true ] && [ -n "${VETH_HOST:-}" ] && sudo ip link delete "$VETH_HOST" 2> /dev/null || true
-    [ -n "${PROFILE_PATH:-}" ] && rm -f "$PROFILE_PATH" || true
-    [ -n "${DNS_PROXY_PY:-}" ] && rm -f "$DNS_PROXY_PY" || true
-    if [ "$NS_CREATED" = true ] || [ "$VETH_CREATED" = true ] || [ -n "${TUN_PID:-}" ] || [ -n "${PROFILE_PATH:-}" ]; then
+
+    kill_if_set "${TUN_PID:-}" true
+    kill_if_set "${SOCAT_PID:-}"
+    kill_if_set "${DNS_PID:-}"
+
+    if [ "$NS_CREATED" = true ] && [ -n "${NS_NAME:-}" ]; then
+        sudo ip netns delete "$NS_NAME" 2>/dev/null || true
+    fi
+    if [ "$VETH_CREATED" = true ] && [ -n "${VETH_HOST:-}" ]; then
+        sudo ip link delete "$VETH_HOST" 2>/dev/null || true
+    fi
+
+    if [ -n "${PROFILE_PATH:-}" ]; then rm -f "$PROFILE_PATH"; fi
+    if [ -n "${DNS_PROXY_PY:-}" ]; then rm -f "$DNS_PROXY_PY"; fi
+
+    if [ -n "${LOCK_FD:-}" ]; then
+        flock -u "$LOCK_FD" 2>/dev/null || true
+    fi
+
+    if [ "$had_state" = true ]; then
         log "Cleanup complete."
     fi
 }
@@ -86,6 +112,67 @@ suggest_install_command() {
     fi
 }
 
+add_whitelist_mount() {
+    local host_path="$1"
+    if [ ! -e "$host_path" ]; then return; fi
+
+    WHITELIST_ARGS+=("--whitelist=$host_path")
+
+    if [[ "$host_path" == "$REAL_HOME"* ]]; then
+        local rel_path="${host_path#"$REAL_HOME"/}"
+        local fake_path="$HOME_DIR/$rel_path"
+
+        if [ "$fake_path" != "$HOME_DIR" ]; then
+            mkdir -p "$(dirname "$fake_path")"
+            ln -sfn "$host_path" "$fake_path"
+        fi
+    fi
+}
+
+list_identities() {
+    local identity_root="$REAL_HOME/.sandbox_identities"
+    if [ ! -d "$identity_root" ]; then
+        log "No identities found. Directory does not exist: $identity_root"
+        return 0
+    fi
+
+    local found=false
+    for dir in "$identity_root"/*/; do
+        [ -d "$dir" ] || continue
+        local name
+        name=$(basename "$dir")
+        local home_dir="$dir/home"
+        local size="N/A"
+        if [ -d "$home_dir" ]; then
+            size=$(du -sh "$home_dir" 2>/dev/null | awk '{print $1}')
+        fi
+        log "  $name  (state: $size, path: $dir)"
+        found=true
+    done
+
+    if [ "$found" = false ]; then
+        log "No identities found in $identity_root"
+    fi
+}
+
+delete_identity() {
+    local name="$1"
+    name=$(echo "$name" | tr -cd 'a-zA-Z0-9_-')
+    if [ -z "$name" ]; then
+        error "Invalid identity name for deletion."
+    fi
+
+    local identity_dir="$REAL_HOME/.sandbox_identities/$name"
+    if [ ! -d "$identity_dir" ]; then
+        error "Identity '$name' does not exist at $identity_dir"
+    fi
+
+    log "Deleting identity '$name' and all associated state..."
+    log "  Path: $identity_dir"
+    rm -rf "$identity_dir"
+    log "Identity '$name' deleted successfully."
+}
+
 show_help() {
     cat << EOF
 =================================================================
@@ -99,10 +186,13 @@ Options:
   -p, --port <number>      Host SOCKS5 proxy port (Default: 10808)
   -f, --profile <name>     Explicitly use/override pre-existing Firejail profile
   -d, --dns <ip>           Upstream DNS resolver IP (Default: 1.1.1.1)
+  -t, --timeout <seconds>  Kill sandbox after N seconds (0 = no timeout, Default: 0)
   --gui                    Enable GUI support (X11 & Wayland forwarding)
   --verbose                Enable detailed step-by-step logging
   --trace                  Enable shell tracing (set -x) for debugging
   --dry-run                Show proposed topology and profile without altering system
+  --list                   List all existing identities and their state
+  --delete <name>          Delete an identity and all its persistent state
   -h, --help               Show help menu
 
 Examples:
@@ -111,6 +201,12 @@ Examples:
 
   # Run a CLI agent with isolated persistent state:
   $SCRIPT_NAME -i qoder_astral -w ~/.agents -- qodercli
+
+  # List all identities:
+  $SCRIPT_NAME --list
+
+  # Delete an identity:
+  $SCRIPT_NAME --delete trae-acc1
 =================================================================
 EOF
     exit 0
@@ -151,6 +247,8 @@ main() {
     local SOCKS_PORT="10808"
     local USER_PROFILE=""
     local GUI_ENABLED=false
+    local ACTION="run"
+    local DELETE_TARGET=""
 
     while [[ "$#" -gt 0 ]]; do
         case "$1" in
@@ -174,6 +272,10 @@ main() {
                 DNS_SERVER="$2"
                 shift 2
                 ;;
+            -t | --timeout)
+                TIMEOUT="$2"
+                shift 2
+                ;;
             --gui)
                 GUI_ENABLED=true
                 shift
@@ -189,6 +291,15 @@ main() {
             --dry-run)
                 DRY_RUN=true
                 shift
+                ;;
+            --list)
+                ACTION="list"
+                shift
+                ;;
+            --delete)
+                ACTION="delete"
+                DELETE_TARGET="$2"
+                shift 2
                 ;;
             -h | --help)
                 show_help
@@ -206,6 +317,16 @@ main() {
     # Enable trace if requested
     if [ "$TRACE_ENABLED" = true ]; then
         set -x
+    fi
+
+    # Handle subcommands that don't need the rest of the pipeline
+    if [ "$ACTION" = "list" ]; then
+        list_identities
+        exit 0
+    fi
+    if [ "$ACTION" = "delete" ]; then
+        delete_identity "$DELETE_TARGET"
+        exit 0
     fi
 
     local COMMAND_ARGS=("$@")
@@ -235,10 +356,14 @@ main() {
         error "Invalid DNS IP address format: $DNS_SERVER"
     fi
 
+    if [[ ! "$TIMEOUT" =~ ^[0-9]+$ ]]; then
+        error "Invalid timeout value: '$TIMEOUT'. Must be a non-negative integer."
+    fi
+
     # --- 3. PREREQUISITES CHECK ---
     verbose "Checking system dependencies..."
     local missing=()
-    for cmd in firejail socat tun2socks ip python3; do
+    for cmd in firejail socat tun2socks ip python3 md5sum realpath flock; do
         if ! command -v "$cmd" > /dev/null 2>&1; then
             missing+=("$cmd")
         fi
@@ -254,14 +379,11 @@ main() {
     HASH=$(echo -n "$IDENTITY" | md5sum | awk '{print $1}')
     local SESSION_HASH=${HASH:0:6}
 
-    # Generate a valid, persistent MAC Address
     local MAC_ADDR="02:${HASH:2:2}:${HASH:4:2}:${HASH:6:2}:${HASH:8:2}:${HASH:10:2}"
 
-    # Network Params
     NS_NAME="ns-$SESSION_HASH"
     VETH_HOST="vh-$SESSION_HASH"
     local VETH_NS="vn-$SESSION_HASH"
-    # Using 16# to ensure base16
     local OCTET=$((1 + 16#${HASH:0:2} % 254))
     local PROXY_IP="10.250.$OCTET.1"
     local NS_IP="10.250.$OCTET.2"
@@ -274,6 +396,20 @@ main() {
     local IDENTITY_ROOT="$REAL_HOME/.sandbox_identities/$IDENTITY"
     local HOME_DIR="$IDENTITY_ROOT/home"
     local CONFIG_DIR="$IDENTITY_ROOT/.sandbox_configs"
+
+    # --- Concurrent run guard (flock) ---
+    mkdir -p "$IDENTITY_ROOT"
+    exec {LOCK_FD}>"$IDENTITY_ROOT/.lock"
+    if ! flock -n "$LOCK_FD"; then
+        error "Another sandbox instance for identity '$IDENTITY' is already running."
+    fi
+
+    # --- Port conflict detection ---
+    # We check if the port is bound to wildcard addresses (0.0.0.0, [::], or *) or the specific proxy IP.
+    # A listener on 127.0.0.1 is not a conflict, as we redirect traffic to it.
+    if ss -tlnp 2>/dev/null | grep -q -E "(0\.0\.0\.0|\[::\]|\*|$(echo "$PROXY_IP" | sed 's/\./\\./g')):$SOCKS_PORT "; then
+        error "Port $SOCKS_PORT is already in use. Choose a different port with -p."
+    fi
 
     # --- 6. NATIVE PROFILE RESOLUTION ---
     verbose "Resolving Firejail profile..."
@@ -317,13 +453,20 @@ main() {
         ETC_LIST="resolv.conf,hosts,ssl,ca-certificates,pki,crypto-policies"
     fi
 
+    local INCLUDE_LINE=""
+    if [ -n "$NATIVE_PROFILE" ]; then
+        INCLUDE_LINE="include $NATIVE_PROFILE"
+    fi
+
     local PROFILE_CONTENT
     PROFILE_CONTENT=$(cat << EOF
 # Dynamic Security Profile for Identity: $IDENTITY
-$( [ -n "$NATIVE_PROFILE" ] && echo "include $NATIVE_PROFILE" || true )
+${INCLUDE_LINE}
 
 # Identity Spoofing
 hostname $IDENTITY
+# NOTE: 'machine-id' is parameterless in Firejail. Custom values (e.g. 'machine-id <value>') are invalid.
+# This randomizes the machine ID inside the sandbox to prevent fingerprinting.
 machine-id
 
 # Block Hardware Telemetry (Defeats Electron PC Fingerprinting)
@@ -352,18 +495,9 @@ EOF
 )
 
     if [ "$GUI_ENABLED" = true ]; then
-        PROFILE_CONTENT+=$'\n'$(cat << EOF
-whitelist /tmp/.X11-unix
-EOF
-)
+        PROFILE_CONTENT+=$'\n'"whitelist /tmp/.X11-unix"
     else
-        PROFILE_CONTENT+=$'\n'$(cat << EOF
-ipc-namespace
-nodbus
-nosound
-no3d
-EOF
-)
+        PROFILE_CONTENT+=$'\n'"ipc-namespace"$'\n'"nodbus"$'\n'"nosound"$'\n'"no3d"
     fi
 
     # --- 8. DRY-RUN MODE ---
@@ -377,10 +511,26 @@ EOF
         log "  Upstream Proxy:      $SOCKS_PROXY"
         log "  Upstream DNS:        $DNS_SERVER"
         log "  State Home Directory: $HOME_DIR"
+        log "  Machine ID:          Spoofed (Random)"
+        if [ "$TIMEOUT" -gt 0 ]; then
+            log "  Timeout:             ${TIMEOUT}s"
+        fi
         log "Proposed Firejail Profile:"
         echo "--------------------------------------------------------"
         echo "$PROFILE_CONTENT"
         echo "--------------------------------------------------------"
+        log "Proposed Whitelist Mounts:"
+        log "  Identity root: $IDENTITY_ROOT"
+        log "  Working dir:   $TARGET_DIR"
+        if [[ "$CMD_PATH" == "$REAL_HOME"* ]]; then
+            log "  Command path:  $CMD_PATH"
+        fi
+        if [ -n "$WHITELIST_INPUT" ]; then
+            IFS=',' read -ra WL_ITEMS <<< "$WHITELIST_INPUT"
+            for item in "${WL_ITEMS[@]}"; do
+                log "  User whitelist: $item"
+            done
+        fi
         exit 0
     fi
 
@@ -389,22 +539,23 @@ EOF
     mkdir -p "$HOME_DIR"
     mkdir -p "$CONFIG_DIR"
 
-    # Generate secure temporary files under the configuration directory
     verbose "Creating secure session configuration files..."
     DNS_PROXY_PY=$(mktemp "$CONFIG_DIR/dns_proxy_XXXXXX.py")
     PROFILE_PATH=$(mktemp "$CONFIG_DIR/sandbox_XXXXXX.profile")
 
-    # Write the profile file
     echo "$PROFILE_CONTENT" > "$PROFILE_PATH"
 
-    # Write the DNS proxy python script
     verbose "Writing DNS UDP-to-TCP translator script..."
     cat << EOF > "$DNS_PROXY_PY"
-import socket, sys
+import socket, sys, os
+def log_err(msg):
+    print(f"[dns-proxy] {msg}", file=sys.stderr, flush=True)
 def forward_dns():
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try: udp_sock.bind(('127.0.0.1', 53))
-    except Exception: sys.exit(1)
+    except Exception as e:
+        log_err(f"Failed to bind UDP port 53: {e}")
+        sys.exit(1)
     udp_sock.settimeout(1.0)
     while True:
         try:
@@ -418,7 +569,9 @@ def forward_dns():
                 tcp_sock.connect(('$DNS_SERVER', 53))
                 tcp_sock.sendall(tcp_data)
                 resp_len_buf = tcp_sock.recv(2)
-                if len(resp_len_buf) < 2: continue
+                if len(resp_len_buf) < 2:
+                    log_err("Incomplete TCP length header from upstream")
+                    continue
                 resp_len = (resp_len_buf[0] << 8) + resp_len_buf[1]
                 resp_data = b''
                 while len(resp_data) < resp_len:
@@ -427,16 +580,25 @@ def forward_dns():
                     resp_data += chunk
                 if len(resp_data) == resp_len:
                     udp_sock.sendto(resp_data, addr)
-            except Exception: pass
+                else:
+                    log_err(f"Truncated DNS response: got {len(resp_data)}/{resp_len} bytes")
+            except Exception as e:
+                log_err(f"Upstream query failed: {e}")
             finally: tcp_sock.close()
         except socket.timeout: continue
         except KeyboardInterrupt: break
-        except Exception: pass
+        except Exception as e:
+            log_err(f"Unexpected error: {e}")
 if __name__ == '__main__': forward_dns()
 EOF
 
     # --- 10. NETWORK NAMESPACE SETUP ---
     log "Initializing hardware-spoofed network for identity [$IDENTITY]..."
+
+    # Pre-flight: clean up stale namespace/veth from a previous crashed run
+    sudo ip netns delete "$NS_NAME" 2>/dev/null || true
+    sudo ip link delete "$VETH_HOST" 2>/dev/null || true
+
     verbose "Adding network namespace: $NS_NAME"
     sudo ip netns add "$NS_NAME"
     NS_CREATED=true
@@ -446,7 +608,6 @@ EOF
     verbose "Moving $VETH_NS to namespace $NS_NAME"
     sudo ip link set "$VETH_NS" netns "$NS_NAME"
 
-    # Apply the persistent spoofed MAC address to the sandbox interface
     verbose "Setting spoofed MAC address $MAC_ADDR on $VETH_NS"
     sudo ip netns exec "$NS_NAME" ip link set dev "$VETH_NS" address "$MAC_ADDR"
 
@@ -472,9 +633,8 @@ EOF
     sudo ip netns exec "$NS_NAME" tun2socks -device tun0 -proxy "$SOCKS_PROXY" > /dev/null 2>&1 &
     TUN_PID=$!
 
-    # Active synchronization check
     verbose "Synchronizing network interface and proxy connectivity..."
-    local max_attempts=50 # 5 seconds max (50 * 0.1s)
+    local max_attempts=50
     local attempt=0
     local tun_up=false
     local proxy_up=false
@@ -486,7 +646,7 @@ EOF
             fi
         fi
         if ! $proxy_up; then
-            if python3 -c "import socket; s = socket.socket(); s.settimeout(0.1); s.connect(('$PROXY_IP', $SOCKS_PORT)); s.close()" 2>/dev/null; then
+            if (echo > /dev/tcp/$PROXY_IP/$SOCKS_PORT) 2>/dev/null; then
                 proxy_up=true
                 verbose "Proxy port $SOCKS_PORT is reachable on host side."
             fi
@@ -501,7 +661,6 @@ EOF
         error "Failed to synchronize network interface (tun0) or proxy port ($SOCKS_PORT)."
     fi
 
-    # Start DNS proxy python server
     verbose "Starting DNS proxy python script..."
     sudo ip netns exec "$NS_NAME" python3 "$DNS_PROXY_PY" > /dev/null 2>&1 &
     DNS_PID=$!
@@ -510,38 +669,14 @@ EOF
     verbose "Configuring whitelisting..."
     local WHITELIST_ARGS=()
 
-    # 1. We MUST whitelist the identity root so the sandbox can read/write the persistent configs
     WHITELIST_ARGS+=("--whitelist=$IDENTITY_ROOT")
 
-    add_whitelist_mount() {
-        local host_path="$1"
-        if [ ! -e "$host_path" ]; then return; fi
-
-        # Whitelist the absolute path so Firejail bind-mounts it into the sandbox
-        WHITELIST_ARGS+=("--whitelist=$host_path")
-
-        # If the path is inside the real home directory, create a symlink in the fake home.
-        # This ensures that if the IDE looks for $HOME/project, it finds the real whitelisted files.
-        if [[ "$host_path" == "$REAL_HOME"* ]]; then
-            local rel_path="${host_path#"$REAL_HOME"/}"
-            local fake_path="$HOME_DIR/$rel_path"
-
-            if [ "$fake_path" != "$HOME_DIR" ]; then
-                mkdir -p "$(dirname "$fake_path")"
-                ln -sfn "$host_path" "$fake_path"
-            fi
-        fi
-    }
-
-    # 2. Mount the current working directory so the IDE can open the project
     add_whitelist_mount "$TARGET_DIR"
 
-    # 3. Mount the execution binary if it resides in the home folder (like ~/.local/bin/qodercli)
     if [[ "$CMD_PATH" == "$REAL_HOME"* ]]; then
         add_whitelist_mount "$CMD_PATH"
     fi
 
-    # 4. Mount User-Defined Whitelists (like ~/.agents)
     if [ -n "$WHITELIST_INPUT" ]; then
         IFS=',' read -ra ADDR <<< "$WHITELIST_INPUT"
         for dir in "${ADDR[@]}"; do
@@ -561,19 +696,21 @@ EOF
     log "--------------------------------------------------------"
     log "Identity:        $IDENTITY"
     log "Spoofed MAC:     $MAC_ADDR"
+    log "Machine ID:      Spoofed (Random)"
+    log "Namespace:       $NS_NAME"
     log "State Directory: $HOME_DIR"
+    if [ "$TIMEOUT" -gt 0 ]; then
+        log "Timeout:         ${TIMEOUT}s"
+    fi
     log "--------------------------------------------------------"
 
-    # We trick the application into saving all its configs, logins, and telemetry
-    # into our isolated identity folder by aggressively setting the HOME and XDG variables.
     local ENV_ARGS=(
         "HOME=$HOME_DIR"
         "XDG_CONFIG_HOME=$HOME_DIR/.config"
         "XDG_DATA_HOME=$HOME_DIR/.local/share"
         "XDG_STATE_HOME=$HOME_DIR/.local/state"
         "XDG_CACHE_HOME=$HOME_DIR/.cache"
-        "TERM=xterm-256color"
-        "LANG=en_US.UTF-8"
+        "LANG=${LANG:-en_US.UTF-8}"
         "USER=user"
         "LOGNAME=user"
         "SHELL=/bin/bash"
@@ -581,15 +718,30 @@ EOF
     )
 
     if [ "$GUI_ENABLED" = true ]; then
-        [ -n "${DISPLAY:-}" ] && ENV_ARGS+=("DISPLAY=$DISPLAY")
-        [ -n "${WAYLAND_DISPLAY:-}" ] && ENV_ARGS+=("WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
-        [ -n "${XAUTHORITY:-}" ] && ENV_ARGS+=("XAUTHORITY=$XAUTHORITY")
-        [ -n "${XDG_RUNTIME_DIR:-}" ] && ENV_ARGS+=("XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR")
+        if [ -n "${DISPLAY:-}" ]; then
+            ENV_ARGS+=("DISPLAY=$DISPLAY")
+        fi
+        if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+            ENV_ARGS+=("WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
+        fi
+        if [ -n "${XAUTHORITY:-}" ]; then
+            ENV_ARGS+=("XAUTHORITY=$XAUTHORITY")
+            WHITELIST_ARGS+=("--whitelist=$XAUTHORITY")
+        fi
+        if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+            ENV_ARGS+=("XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR")
+        fi
+    fi
+
+    local TIMEOUT_ARGS=()
+    if [ "$TIMEOUT" -gt 0 ]; then
+        TIMEOUT_ARGS=("timeout" "--signal=TERM" "--kill-after=5" "$TIMEOUT")
     fi
 
     verbose "Running firejail within namespace $NS_NAME..."
     sudo ip netns exec "$NS_NAME" sudo -u "$REAL_USER" env -i \
         "${ENV_ARGS[@]}" \
+        "${TIMEOUT_ARGS[@]}" \
         firejail \
         --profile="$PROFILE_PATH" \
         "${WHITELIST_ARGS[@]}" \
