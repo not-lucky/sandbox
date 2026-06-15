@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly SCRIPT_NAME=$(basename "$0")
-readonly SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+SCRIPT_NAME=$(basename "$0")
+readonly SCRIPT_NAME
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
-error() { log "ERROR: $*" >&2; exit 1; }
+error() {
+    log "ERROR: $*" >&2
+    exit 1
+}
 
 # ==============================================================================
 # UNIFIED IDENTITY-BASED SECURE WORKSPACE MANAGER (ARCH SAFE)
@@ -23,7 +26,7 @@ readonly REAL_USER="${USER:-}"
 readonly REAL_HOME="${HOME:-}"
 
 show_help() {
-    cat <<EOF
+    cat << EOF
 =================================================================
     Identity-Based Secure Workspace Manager
 =================================================================
@@ -58,19 +61,19 @@ main() {
 
     while [[ "$#" -gt 0 ]]; do
         case "$1" in
-            -i|--identity)
+            -i | --identity)
                 IDENTITY="$2"
                 shift 2
                 ;;
-            -w|--whitelist)
+            -w | --whitelist)
                 WHITELIST_INPUT="$2"
                 shift 2
                 ;;
-            -p|--port)
+            -p | --port)
                 SOCKS_PORT="$2"
                 shift 2
                 ;;
-            -f|--profile)
+            -f | --profile)
                 USER_PROFILE="$2"
                 shift 2
                 ;;
@@ -78,7 +81,7 @@ main() {
                 GUI_ENABLED=true
                 shift
                 ;;
-            -h|--help)
+            -h | --help)
                 show_help
                 ;;
             --)
@@ -91,7 +94,7 @@ main() {
         esac
     done
 
-    local COMMAND_ARGS=( "$@" )
+    local COMMAND_ARGS=("$@")
 
     if [ ${#COMMAND_ARGS[@]} -eq 0 ]; then
         error "No command specified to run."
@@ -100,7 +103,8 @@ main() {
     IDENTITY=$(echo "$IDENTITY" | tr -cd 'a-zA-Z0-9_-')
 
     # --- 2. GENERATE DETERMINISTIC HARDWARE SPOOFING ---
-    local HASH=$(echo -n "$IDENTITY" | md5sum | awk '{print $1}')
+    local HASH
+    HASH=$(echo -n "$IDENTITY" | md5sum | awk '{print $1}')
     local SESSION_HASH=${HASH:0:6}
 
     # Generate a valid, persistent MAC Address
@@ -111,12 +115,13 @@ main() {
     local VETH_HOST="vh-$SESSION_HASH"
     local VETH_NS="vn-$SESSION_HASH"
     # Using 16# to ensure base16
-    local OCTET=$(( 1 + 16#${HASH:0:2} % 254 ))
+    local OCTET=$((1 + 16#${HASH:0:2} % 254))
     local PROXY_IP="10.250.$OCTET.1"
     local NS_IP="10.250.$OCTET.2"
     local SOCKS_PROXY="socks5://$PROXY_IP:$SOCKS_PORT"
 
-    local TARGET_DIR=$(pwd)
+    local TARGET_DIR
+    TARGET_DIR=$(pwd)
 
     # --- 3. CONFIGURE PERSISTENT IDENTITY DIRECTORIES ---
     local IDENTITY_ROOT="$REAL_HOME/.sandbox_identities/$IDENTITY"
@@ -126,7 +131,7 @@ main() {
 
     # --- 4. PREREQUISITES & CLEANUP ---
     for cmd in firejail socat tun2socks ip python3; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
+        if ! command -v "$cmd" > /dev/null 2>&1; then
             error "System dependency '$cmd' is missing."
         fi
     done
@@ -140,11 +145,11 @@ main() {
 
     cleanup() {
         log "Saving state and cleaning up identity [$IDENTITY]..."
-        [ -n "${TUN_PID:-}" ] && sudo kill "$TUN_PID" 2>/dev/null || true
-        [ -n "${SOCAT_PID:-}" ] && kill "$SOCAT_PID" 2>/dev/null || true
-        [ -n "${DNS_PID:-}" ] && kill "$DNS_PID" 2>/dev/null || true
-        sudo ip netns delete "$NS_NAME" 2>/dev/null || true
-        sudo ip link delete "$VETH_HOST" 2>/dev/null || true
+        [ -n "${TUN_PID:-}" ] && sudo kill "$TUN_PID" 2> /dev/null || true
+        [ -n "${SOCAT_PID:-}" ] && kill "$SOCAT_PID" 2> /dev/null || true
+        [ -n "${DNS_PID:-}" ] && kill "$DNS_PID" 2> /dev/null || true
+        sudo ip netns delete "$NS_NAME" 2> /dev/null || true
+        sudo ip link delete "$VETH_HOST" 2> /dev/null || true
         [ -n "${PROFILE_PATH:-}" ] && rm -f "$PROFILE_PATH" || true
         [ -n "${DNS_PROXY_PY:-}" ] && rm -f "$DNS_PROXY_PY" || true
         log "Cleanup complete."
@@ -222,21 +227,21 @@ EOF
     local WHITELIST_ARGS=()
 
     # 1. We MUST whitelist the identity root so the sandbox can read/write the persistent configs
-    WHITELIST_ARGS+=( "--whitelist=$IDENTITY_ROOT" )
+    WHITELIST_ARGS+=("--whitelist=$IDENTITY_ROOT")
 
     add_whitelist_mount() {
         local host_path="$1"
         if [ ! -e "$host_path" ]; then return; fi
-        
+
         # Whitelist the absolute path so Firejail bind-mounts it into the sandbox
-        WHITELIST_ARGS+=( "--whitelist=$host_path" )
+        WHITELIST_ARGS+=("--whitelist=$host_path")
 
         # If the path is inside the real home directory, create a symlink in the fake home.
         # This ensures that if the IDE looks for $HOME/project, it finds the real whitelisted files.
         if [[ "$host_path" == "$REAL_HOME"* ]]; then
-            local rel_path="${host_path#$REAL_HOME/}"
+            local rel_path="${host_path#"$REAL_HOME"/}"
             local fake_path="$HOME_DIR/$rel_path"
-            
+
             if [ "$fake_path" != "$HOME_DIR" ]; then
                 mkdir -p "$(dirname "$fake_path")"
                 ln -sfn "$host_path" "$fake_path"
@@ -249,7 +254,8 @@ EOF
 
     # 3. Mount the execution binary if it resides in the home folder (like ~/.local/bin/qodercli)
     local CMD_NAME="${COMMAND_ARGS[0]}"
-    local CMD_PATH=$(which "$CMD_NAME" 2>/dev/null || realpath "$CMD_NAME" 2>/dev/null || echo "$CMD_NAME")
+    local CMD_PATH
+    CMD_PATH=$(command -v "$CMD_NAME" 2> /dev/null || realpath "$CMD_NAME" 2> /dev/null || echo "$CMD_NAME")
     if [[ "$CMD_PATH" == "$REAL_HOME"* ]]; then
         add_whitelist_mount "$CMD_PATH"
     fi
@@ -258,35 +264,43 @@ EOF
     if [ -n "$WHITELIST_INPUT" ]; then
         IFS=',' read -ra ADDR <<< "$WHITELIST_INPUT"
         for dir in "${ADDR[@]}"; do
-            if [[ "$dir" == "~/"* ]]; then
+            if [[ "$dir" == \~/* ]]; then
                 local ABS_DIR="$REAL_HOME/${dir#~/}"
             elif [ "$dir" == "~" ]; then
                 local ABS_DIR="$REAL_HOME"
             else
-                local ABS_DIR=$(realpath -m "$dir" 2>/dev/null || echo "$dir")
+                local ABS_DIR
+                ABS_DIR=$(realpath -m "$dir" 2> /dev/null || echo "$dir")
             fi
             add_whitelist_mount "$ABS_DIR"
         done
     fi
 
     # --- 6.5 NATIVE PROFILE RESOLUTION ---
-    local CMD_BASE=$(basename "$CMD_PATH" 2>/dev/null || echo "$CMD_NAME")
+    local CMD_BASE
+    CMD_BASE=$(basename "$CMD_PATH" 2> /dev/null || echo "$CMD_NAME")
     local NATIVE_PROFILE=""
 
     if [ -n "$USER_PROFILE" ]; then
-        if [[ "$USER_PROFILE" == "~/"* ]]; then NATIVE_PROFILE="$REAL_HOME/${USER_PROFILE#~/}"
+        if [[ "$USER_PROFILE" == \~/* ]]; then
+            NATIVE_PROFILE="$REAL_HOME/${USER_PROFILE#~/}"
         elif [[ "$USER_PROFILE" == "/"* || "$USER_PROFILE" == "./"* || "$USER_PROFILE" == "../"* ]]; then
-            NATIVE_PROFILE=$(realpath -m "$USER_PROFILE" 2>/dev/null || echo "$USER_PROFILE")
+            NATIVE_PROFILE=$(realpath -m "$USER_PROFILE" 2> /dev/null || echo "$USER_PROFILE")
         else
-            if [[ "$USER_PROFILE" != *".profile" ]]; then NATIVE_PROFILE="${USER_PROFILE}.profile"
+            if [[ "$USER_PROFILE" != *".profile" ]]; then
+                NATIVE_PROFILE="${USER_PROFILE}.profile"
             else NATIVE_PROFILE="$USER_PROFILE"; fi
         fi
     else
         if [ -n "$CMD_BASE" ]; then
-            if [ -f "$REAL_HOME/.config/firejail/${CMD_BASE}.profile" ]; then NATIVE_PROFILE="${CMD_BASE}.profile"
-            elif [ -f "/etc/firejail/${CMD_BASE}.profile" ]; then NATIVE_PROFILE="${CMD_BASE}.profile"
-            elif [ "$CMD_BASE" = "vscodium" ] && [ -f "/etc/firejail/codium.profile" ]; then NATIVE_PROFILE="codium.profile"
-            elif [ "$CMD_BASE" = "trae" ] && [ -f "/etc/firejail/codium.profile" ]; then NATIVE_PROFILE="codium.profile"
+            if [ -f "$REAL_HOME/.config/firejail/${CMD_BASE}.profile" ]; then
+                NATIVE_PROFILE="${CMD_BASE}.profile"
+            elif [ -f "/etc/firejail/${CMD_BASE}.profile" ]; then
+                NATIVE_PROFILE="${CMD_BASE}.profile"
+            elif [ "$CMD_BASE" = "vscodium" ] && [ -f "/etc/firejail/codium.profile" ]; then
+                NATIVE_PROFILE="codium.profile"
+            elif [ "$CMD_BASE" = "trae" ] && [ -f "/etc/firejail/codium.profile" ]; then
+                NATIVE_PROFILE="codium.profile"
             fi
         fi
     fi
@@ -303,7 +317,7 @@ EOF
         ETC_LIST="resolv.conf,hosts,ssl,ca-certificates,pki,crypto-policies"
     fi
 
-    cat <<EOF >> "$PROFILE_PATH"
+    cat << EOF >> "$PROFILE_PATH"
 # Identity Spoofing
 hostname $IDENTITY
 machine-id
@@ -335,7 +349,7 @@ EOF
     if [ "$GUI_ENABLED" = true ]; then
         echo "whitelist /tmp/.X11-unix" >> "$PROFILE_PATH"
     else
-        cat <<EOF >> "$PROFILE_PATH"
+        cat << EOF >> "$PROFILE_PATH"
 ipc-namespace
 nodbus
 nosound
@@ -350,7 +364,7 @@ EOF
     log "State Directory: $HOME_DIR"
     log "--------------------------------------------------------"
 
-    # We trick the application into saving all its configs, logins, and telemetry 
+    # We trick the application into saving all its configs, logins, and telemetry
     # into our isolated identity folder by aggressively setting the HOME and XDG variables.
     local ENV_ARGS=(
         "HOME=$HOME_DIR"
@@ -367,10 +381,10 @@ EOF
     )
 
     if [ "$GUI_ENABLED" = true ]; then
-        [ -n "${DISPLAY:-}" ] && ENV_ARGS+=( "DISPLAY=$DISPLAY" )
-        [ -n "${WAYLAND_DISPLAY:-}" ] && ENV_ARGS+=( "WAYLAND_DISPLAY=$WAYLAND_DISPLAY" )
-        [ -n "${XAUTHORITY:-}" ] && ENV_ARGS+=( "XAUTHORITY=$XAUTHORITY" )
-        [ -n "${XDG_RUNTIME_DIR:-}" ] && ENV_ARGS+=( "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" )
+        [ -n "${DISPLAY:-}" ] && ENV_ARGS+=("DISPLAY=$DISPLAY")
+        [ -n "${WAYLAND_DISPLAY:-}" ] && ENV_ARGS+=("WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
+        [ -n "${XAUTHORITY:-}" ] && ENV_ARGS+=("XAUTHORITY=$XAUTHORITY")
+        [ -n "${XDG_RUNTIME_DIR:-}" ] && ENV_ARGS+=("XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR")
     fi
 
     sudo ip netns exec "$NS_NAME" sudo -u "$REAL_USER" env -i \
