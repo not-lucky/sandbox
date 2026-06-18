@@ -47,6 +47,17 @@ readonly MAX_IDENTITY_LEN=64
 readonly STALE_TEMP_DAYS=1
 readonly SEPARATOR="--------------------------------------------------------"
 
+# Network configuration constants
+readonly PROXY_NETWORK_BASE="10.250"
+readonly PROXY_NETMASK="24"
+readonly IDENTITY_HASH_LENGTH=6
+readonly DNS_PORT=53
+readonly DNS_TIMEOUT=4
+
+# Process management constants
+readonly SIGTERM_WAIT=0.5
+readonly SIGKILL_WAIT=0.5
+
 # Global State (set during execution, consumed by cleanup trap)
 IDENTITY=""
 TUN_PID=""
@@ -61,6 +72,12 @@ VETH_CREATED=false
 LOCK_FD=""
 COMMAND_ARGS=()
 
+# Command cache for performance optimization
+declare -A CMD_CACHE=()
+
+# Identity hash cache to avoid repeated md5sum calculations
+declare -A HASH_CACHE=()
+
 # Global Flags
 VERBOSE_ENABLED=false
 TRACE_ENABLED=false
@@ -69,6 +86,29 @@ FORCE=false
 DNS_SERVER="$DEFAULT_DNS_SERVER"
 TIMEOUT=0
 NO_SANDBOX=false
+CONFIG_FILE=""
+SHOW_CONFIG=false
+CLEANUP_ONLY=false
+
+# Progress indicator state
+PROGRESS_ENABLED=false
+PROGRESS_PID=""
+
+# Audit logging
+AUDIT_ENABLED=false
+AUDIT_FILE=""
+
+# Identity export/import
+EXPORT_TARGET=""
+IMPORT_TARGET=""
+CLONE_TARGET=""
+
+# Logging levels
+declare -r LOG_LEVEL_DEBUG=0
+declare -r LOG_LEVEL_INFO=1
+declare -r LOG_LEVEL_WARN=2
+declare -r LOG_LEVEL_ERROR=3
+CURRENT_LOG_LEVEL=$LOG_LEVEL_INFO
 
 # --- Color Setup ---
 # Only emit ANSI color codes when stdout is a terminal. Pipes, redirects, and
@@ -86,29 +126,207 @@ setup_colors() {
 }
 setup_colors
 
+# --- Config File Loading ---
+load_config_file() {
+  local config_path=""
+
+  # Check XDG_CONFIG_HOME first, then ~/.sandboxrc
+  if [[ -n "${XDG_CONFIG_HOME:-}" ]] && [[ -f "$XDG_CONFIG_HOME/sandbox/config" ]]; then
+    config_path="$XDG_CONFIG_HOME/sandbox/config"
+  elif [[ -f "$HOME/.sandboxrc" ]]; then
+    config_path="$HOME/.sandboxrc"
+  fi
+
+  if [[ -n "$config_path" ]]; then
+    verbose "Loading config from: $config_path"
+    check_file_permission "$config_path" "read"
+    CONFIG_FILE="$config_path"
+
+    # Read config file line by line, skipping comments and empty lines
+    while IFS='=' read -r key value; do
+      # Skip comments and empty lines
+      [[ "$key" =~ ^[[:space:]]*# ]] && continue
+      [[ -z "$key" ]] && continue
+
+      # Trim whitespace
+      key="${key// /}"
+      value="${value// /}"
+
+      # Apply config values that match our global flags
+      case "$key" in
+        default_identity)
+          # Only set if not already specified via command line
+          [[ -z "${IDENTITY:-}" ]] && IDENTITY="$value"
+          ;;
+        default_dns)
+          # Only set if not already specified via command line
+          [[ "$DNS_SERVER" == "$DEFAULT_DNS_SERVER" ]] && DNS_SERVER="$value"
+          ;;
+        default_socks_port)
+          # Only set if not already specified via command line
+          [[ "$SOCKS_PORT" == "$DEFAULT_SOCKS_PORT" ]] && SOCKS_PORT="$value"
+          ;;
+        default_timeout)
+          # Only set if not already specified via command line
+          [[ "$TIMEOUT" == 0 ]] && TIMEOUT="$value"
+          ;;
+        verbose)
+          [[ "$value" == "true" ]] && VERBOSE_ENABLED=true
+          ;;
+        no_sandbox)
+          [[ "$value" == "true" ]] && NO_SANDBOX=true
+          ;;
+        *)
+          verbose "Unknown config key: $key"
+          ;;
+      esac
+    done < "$config_path"
+  fi
+}
+
 # --- Structured Logging ---
 # printf %T avoids forking date(1) on every log call (significant in tight loops)
-log() { printf '%s[%(%Y-%m-%d %H:%M:%S)T] %s%s\n' "$CLR_INFO" -1 "$*" "$CLR_RESET"; }
-warn() { printf '%s[%(%Y-%m-%d %H:%M:%S)T] WARN: %s%s\n' "$CLR_WARN" -1 "$*" "$CLR_RESET" >&2; }
+log() {
+  ((CURRENT_LOG_LEVEL <= LOG_LEVEL_INFO)) || return 0
+  printf '%s[%(%Y-%m-%d %H:%M:%S)T] %s%s\n' "$CLR_INFO" -1 "$*" "$CLR_RESET"
+}
+warn() {
+  ((CURRENT_LOG_LEVEL <= LOG_LEVEL_WARN)) || return 0
+  printf '%s[%(%Y-%m-%d %H:%M:%S)T] WARN: %s%s\n' "$CLR_WARN" -1 "$*" "$CLR_RESET" >&2
+}
 error() {
-  printf '%s[%(%Y-%m-%d %H:%M:%S)T] ERROR: %s%s\n' "$CLR_ERROR" -1 "$1" "$CLR_RESET" >&2
-  exit "${2:-$EXIT_GENERAL}"
+  local message="$1"
+  local exit_code="${2:-$EXIT_GENERAL}"
+  local suggestion="${3:-}"
+
+  ((CURRENT_LOG_LEVEL <= LOG_LEVEL_ERROR)) || return 0
+  printf '%s[%(%Y-%m-%d %H:%M:%S)T] ERROR: %s%s\n' "$CLR_ERROR" -1 "$message" "$CLR_RESET" >&2
+  if [[ -n "$suggestion" ]]; then
+    printf '%s[%(%Y-%m-%d %H:%M:%S)T] SUGGESTION: %s%s\n' "$CLR_INFO" -1 "$suggestion" "$CLR_RESET" >&2
+  fi
+  exit "$exit_code"
 }
 verbose() {
-  [[ "$VERBOSE_ENABLED" == true ]] || return 0
+  ((CURRENT_LOG_LEVEL <= LOG_LEVEL_DEBUG)) || return 0
   printf '%s[%(%Y-%m-%d %H:%M:%S)T] DEBUG: %s%s\n' "$CLR_DEBUG" -1 "$*" "$CLR_RESET"
 }
 
-# --- Error Trap ---
+# --- Audit Logging ---
+init_audit_log() {
+  [[ "$AUDIT_ENABLED" == true ]] || return 0
+
+  local audit_dir
+  if [[ -n "${XDG_STATE_HOME:-}" ]]; then
+    audit_dir="$XDG_STATE_HOME/sandbox"
+  else
+    audit_dir="$HOME/.local/state/sandbox"
+  fi
+
+  mkdir -p -- "$audit_dir"
+  AUDIT_FILE="$audit_dir/audit.log"
+
+  # Set restrictive permissions on audit log
+  touch -- "$AUDIT_FILE"
+  chmod 600 -- "$AUDIT_FILE"
+}
+
+audit_log() {
+  [[ "$AUDIT_ENABLED" == true ]] || return 0
+  [[ -n "$AUDIT_FILE" ]] || return 0
+
+  local timestamp
+  printf -v timestamp '%(%Y-%m-%d %H:%M:%S)T' -1
+
+  printf '[%s] [%s] %s\n' "$timestamp" "$REAL_USER" "$*" >> "$AUDIT_FILE"
+}
+start_progress() {
+  [[ "$PROGRESS_ENABLED" == true ]] || return 0
+  local message="$1"
+  printf '%s... ' "$message"
+  # Start a background spinner
+  (
+    while true; do
+      printf '.'
+      sleep 0.5
+    done
+  ) &
+  PROGRESS_PID=$!
+}
+
+stop_progress() {
+  [[ "$PROGRESS_ENABLED" == true ]] || return 0
+  [[ -n "${PROGRESS_PID:-}" ]] || return 0
+  kill "$PROGRESS_PID" 2>/dev/null || true
+  wait "$PROGRESS_PID" 2>/dev/null || true
+  PROGRESS_PID=""
+  printf ' done\n'
+}
+
+# --- Signal Handling ---
 on_error() {
   local line="$1" exit_code="$2"
   ((exit_code != 0)) || return 0
   printf '%s[%(%Y-%m-%d %H:%M:%S)T] FATAL: script failed at line %d (exit %d)%s\n' \
     "$CLR_ERROR" -1 "$line" "$exit_code" "$CLR_RESET" >&2
 }
+
+# Cleanup trap for signals - ensures proper cleanup on termination
+cleanup_on_signal() {
+  local signal="$1"
+  verbose "Received signal $signal, initiating cleanup..."
+  cleanup
+  exit 128
+}
+
 trap 'on_error "$LINENO" "$?"' ERR
+trap 'cleanup_on_signal "TERM"' TERM
+trap 'cleanup_on_signal "INT"' INT
+trap 'cleanup_on_signal "PIPE"' PIPE
 
 # --- Utility Functions ---
+
+# Check if a command exists, with caching to avoid repeated lookups.
+# Returns 0 if command exists, 1 otherwise.
+has_command() {
+  local cmd="$1"
+  if [[ -n "${CMD_CACHE[$cmd]:-}" ]]; then
+    [[ "${CMD_CACHE[$cmd]}" == "1" ]]
+  else
+    if command -v "$cmd" >/dev/null 2>&1; then
+      CMD_CACHE[$cmd]="1"
+      return 0
+    else
+      CMD_CACHE[$cmd]="0"
+      return 1
+    fi
+  fi
+}
+
+# Check file permissions before operations
+check_file_permission() {
+  local file="$1" permission="$2"
+  case "$permission" in
+    read)
+      [[ -r "$file" ]] || error "File not readable: $file" "$EXIT_PERMISSION"
+      ;;
+    write)
+      [[ -w "$file" ]] || error "File not writable: $file" "$EXIT_PERMISSION"
+      ;;
+    execute)
+      [[ -x "$file" ]] || error "File not executable: $file" "$EXIT_PERMISSION"
+      ;;
+    *)
+      error "Invalid permission check: $permission" "$EXIT_GENERAL"
+      ;;
+  esac
+}
+
+# Check directory permissions and existence
+check_directory() {
+  local dir="$1" permission="${2:-read}"
+  [[ -d "$dir" ]] || error "Directory does not exist: $dir" "$EXIT_PERMISSION"
+  check_file_permission "$dir" "$permission"
+}
 
 # Check if a PID belongs to a sandbox-related process. Falls back to kill -0
 # when /proc is unavailable (rare on Linux, but defensive).
@@ -218,20 +436,20 @@ recover_stale_instance() {
   fi
 
   local ns_name
-  ns_name="ns-$(_identity_hash "$name" 6)"
+  ns_name="ns-$(_identity_hash "$name")"
   if ip netns list 2>/dev/null | grep -q "^${ns_name}[[:space:]]"; then
     warn "Found lingering namespace '$ns_name' from a previous run. Cleaning up."
     local pids
     mapfile -t pids < <(sudo ip netns pids "$ns_name" 2>/dev/null || true)
     if [[ ${#pids[@]} -gt 0 ]]; then
       sudo kill -TERM "${pids[@]}" 2>/dev/null || true
-      sleep 0.5
+      sleep "$SIGTERM_WAIT"
       sudo kill -KILL "${pids[@]}" 2>/dev/null || true
     fi
     sudo ip netns delete "$ns_name" 2>/dev/null || true
 
     local veth_host
-    veth_host="vh-$(_identity_hash "$name" 6)"
+    veth_host="vh-$(_identity_hash "$name")"
     sudo ip link delete "$veth_host" 2>/dev/null || true
   fi
 }
@@ -246,23 +464,27 @@ suggest_install_command() {
     esac
   done
 
-  if command -v apt-get >/dev/null 2>&1; then
-    log "To install: sudo apt-get update && sudo apt-get install -y ${pkgs[*]}"
-  elif command -v dnf >/dev/null 2>&1; then
-    log "To install: sudo dnf install -y ${pkgs[*]}"
-  elif command -v pacman >/dev/null 2>&1; then
-    log "To install: sudo pacman -S --noconfirm ${pkgs[*]}"
-  elif command -v yay >/dev/null 2>&1; then
-    log "To install: yay -S --noconfirm ${pkgs[*]}"
-  elif command -v paru >/dev/null 2>&1; then
-    log "To install: paru -S --noconfirm ${pkgs[*]}"
-  elif command -v zypper >/dev/null 2>&1; then
-    log "To install: sudo zypper install -y ${pkgs[*]}"
-  elif command -v apk >/dev/null 2>&1; then
-    log "To install: sudo apk add ${pkgs[*]}"
-  else
-    log "Please install: ${pkgs[*]}"
-  fi
+  # Use associative array for package manager detection (cached via has_command)
+  declare -A pkg_managers=(
+    [apt-get]="sudo apt-get update && sudo apt-get install -y ${pkgs[*]}"
+    [dnf]="sudo dnf install -y ${pkgs[*]}"
+    [pacman]="sudo pacman -S --noconfirm ${pkgs[*]}"
+    [yay]="yay -S --noconfirm ${pkgs[*]}"
+    [paru]="paru -S --noconfirm ${pkgs[*]}"
+    [zypper]="sudo zypper install -y ${pkgs[*]}"
+    [apk]="sudo apk add ${pkgs[*]}"
+  )
+
+  local pm_found=false
+  for pm in "${!pkg_managers[@]}"; do
+    if has_command "$pm"; then
+      log "To install: ${pkg_managers[$pm]}"
+      pm_found=true
+      break
+    fi
+  done
+
+  [[ "$pm_found" == true ]] || log "Please install: ${pkgs[*]}"
 }
 
 # Mount a host path into the firejail sandbox. Also creates a symlink inside the
@@ -289,9 +511,19 @@ add_whitelist_mount() {
 
 # Returns the first N hex chars of the identity's md5 hash.
 # Centralizes hashing so we never compute the same hash twice.
+# Uses cache to avoid repeated md5sum calls for the same identity.
 _identity_hash() {
-  local name="$1" len="${2:-6}"
-  printf '%s' "$name" | md5sum | cut -c1-"$len"
+  local name="$1" len="${2:-$IDENTITY_HASH_LENGTH}"
+  local cache_key="${name}:${len}"
+
+  if [[ -n "${HASH_CACHE[$cache_key]:-}" ]]; then
+    printf '%s' "${HASH_CACHE[$cache_key]}"
+  else
+    local hash
+    hash="$(printf '%s' "$name" | md5sum | cut -c1-"$len")"
+    HASH_CACHE[$cache_key]="$hash"
+    printf '%s' "$hash"
+  fi
 }
 
 list_identities() {
@@ -321,6 +553,7 @@ list_identities() {
 
 delete_identity() {
   local name="$1"
+  audit_log "Identity deletion requested: $name"
   local sanitized="${name//[!a-zA-Z0-9_-]/}"
 
   if [[ "$sanitized" != "$name" ]]; then
@@ -345,6 +578,133 @@ delete_identity() {
   log "  Path: $identity_dir"
   rm -rf -- "$identity_dir"
   log "Identity '$sanitized' deleted successfully."
+  audit_log "Identity deleted successfully: $sanitized"
+}
+
+export_identity() {
+  local name="$1"
+  local sanitized="${name//[!a-zA-Z0-9_-]/}"
+  audit_log "Identity export requested: $sanitized"
+
+  if [[ "$sanitized" != "$name" ]]; then
+    warn "Identity name sanitized: '$name' -> '$sanitized'"
+  fi
+  [[ -n "$sanitized" ]] || error "Invalid identity name for export."
+
+  local identity_dir="$REAL_HOME/.sandbox_identities/$sanitized"
+  [[ -d "$identity_dir" ]] || error "Identity '$sanitized' does not exist at $identity_dir"
+
+  local output_file="${EXPORT_TARGET:-${sanitized}-identity.tar.gz}"
+
+  log "Exporting identity '$sanitized' to $output_file..."
+  start_progress "Creating identity archive"
+
+  # Create tar archive with identity state
+  tar -czf "$output_file" -C "$REAL_HOME/.sandbox_identities" "$sanitized" 2>/dev/null
+  local exit_code=$?
+
+  stop_progress
+
+  if ((exit_code != 0)); then
+    error "Failed to export identity '$sanitized'." "$EXIT_GENERAL"
+  fi
+
+  log "Identity '$sanitized' exported successfully to $output_file"
+  audit_log "Identity exported successfully: $sanitized -> $output_file"
+}
+
+import_identity() {
+  local archive_file="$1"
+  local new_name="${2:-}"
+  audit_log "Identity import requested: $archive_file -> $new_name"
+
+  [[ -f "$archive_file" ]] || error "Archive file does not exist: $archive_file" "$EXIT_USAGE"
+
+  # Extract the original identity name from the archive
+  local original_name
+  original_name="$(tar -tzf "$archive_file" 2>/dev/null | head -1 | cut -d'/' -f1)"
+  [[ -n "$original_name" ]] || error "Failed to read archive or archive is invalid." "$EXIT_USAGE"
+
+  # Use provided name or original name
+  local target_name="${new_name:-$original_name}"
+  target_name="${target_name//[!a-zA-Z0-9_-]/}"
+  [[ -n "$target_name" ]] || error "Invalid target identity name."
+
+  local target_dir="$REAL_HOME/.sandbox_identities/$target_name"
+  if [[ -d "$target_dir" ]]; then
+    error "Target identity '$target_name' already exists." "$EXIT_USAGE" "Use --delete to remove the existing identity first, or choose a different name."
+  fi
+
+  log "Importing identity from $archive_file as '$target_name'..."
+  start_progress "Extracting identity archive"
+
+  # Create target directory and extract archive
+  mkdir -p -- "$(dirname -- "$target_dir")"
+
+  # Extract to temporary location first, then rename if needed
+  local temp_dir="$REAL_HOME/.sandbox_identities/.import_temp"
+  rm -rf -- "$temp_dir" 2>/dev/null || true
+  mkdir -p -- "$temp_dir"
+
+  tar -xzf "$archive_file" -C "$temp_dir" 2>/dev/null
+  local exit_code=$?
+
+  if ((exit_code != 0)); then
+    rm -rf -- "$temp_dir"
+    stop_progress
+    error "Failed to extract archive file." "$EXIT_GENERAL"
+  fi
+
+  # Rename if target name differs from original
+  if [[ "$target_name" != "$original_name" ]]; then
+    mv -- "$temp_dir/$original_name" "$temp_dir/$target_name"
+  fi
+
+  # Move to final location
+  mv -- "$temp_dir/$target_name" "$target_dir"
+  rm -rf -- "$temp_dir"
+
+  stop_progress
+
+  log "Identity imported successfully as '$target_name'"
+  audit_log "Identity imported successfully: $archive_file -> $target_name"
+}
+
+clone_identity() {
+  local source_name="$1"
+  local target_name="$2"
+  audit_log "Identity clone requested: $source_name -> $target_name"
+
+  local source_sanitized="${source_name//[!a-zA-Z0-9_-]/}"
+  local target_sanitized="${target_name//[!a-zA-Z0-9_-]/}"
+
+  [[ -n "$source_sanitized" ]] || error "Invalid source identity name."
+  [[ -n "$target_sanitized" ]] || error "Invalid target identity name."
+
+  local source_dir="$REAL_HOME/.sandbox_identities/$source_sanitized"
+  local target_dir="$REAL_HOME/.sandbox_identities/$target_sanitized"
+
+  [[ -d "$source_dir" ]] || error "Source identity '$source_sanitized' does not exist."
+  [[ ! -d "$target_dir" ]] || error "Target identity '$target_sanitized' already exists."
+
+  log "Cloning identity '$source_sanitized' to '$target_sanitized'..."
+  start_progress "Cloning identity"
+
+  # Copy identity directory
+  cp -r -- "$source_dir" "$target_dir"
+  local exit_code=$?
+
+  stop_progress
+
+  if ((exit_code != 0)); then
+    error "Failed to clone identity." "$EXIT_GENERAL"
+  fi
+
+  # Remove any stale PID file from the clone
+  rm -f -- "$target_dir/.sandbox.pid"
+
+  log "Identity cloned successfully from '$source_sanitized' to '$target_sanitized'"
+  audit_log "Identity cloned successfully: $source_sanitized -> $target_sanitized"
 }
 
 show_status() {
@@ -360,7 +720,7 @@ show_status() {
     local name ns_name pid_file pid status="stopped"
     name="$(basename -- "$dir")"
     # Namespace name is derived from the identity hash (must match generate_hardware_ids)
-    ns_name="ns-$(_identity_hash "$name" 6)"
+    ns_name="ns-$(_identity_hash "$name")"
 
     if ip netns list 2>/dev/null | grep -q "^${ns_name}[[:space:]]"; then
       pid_file="$dir/.sandbox.pid"
@@ -368,6 +728,23 @@ show_status() {
         pid="$(<"$pid_file")"
         if is_sandbox_pid "$pid"; then
           status="running (PID: $pid)"
+
+          # Get resource usage if running
+          if has_command ps; then
+            local cpu mem
+            cpu="$(ps -p "$pid" -o %cpu --no-headers 2>/dev/null | xargs || echo "N/A")"
+            mem="$(ps -p "$pid" -o %mem --no-headers 2>/dev/null | xargs || echo "N/A")"
+            status+="  CPU: ${cpu}%  MEM: ${mem}%"
+          fi
+
+          # Get network activity if verbose
+          if [[ "$VERBOSE_ENABLED" == true ]] && has_command ip; then
+            local veth_host
+            veth_host="vh-$(_identity_hash "$name" 6)"
+            local rx_tx
+            rx_tx="$(ip -s link show "$veth_host" 2>/dev/null | awk '/RX:/ {rx=$2} /TX:/ {tx=$2} END {print "RX: "rx" KB, TX: "tx" KB"}')" || rx_tx="N/A"
+            status+="  $rx_tx"
+          fi
         else
           # Namespace exists but PID is dead or belongs to a different process
           status="namespace active (stale PID)"
@@ -386,6 +763,7 @@ show_status() {
 
 stop_identity() {
   local name="$1"
+  audit_log "Identity stop requested: $name"
   name="${name//[!a-zA-Z0-9_-]/}"
   [[ -n "$name" ]] || error "Invalid identity name."
 
@@ -416,27 +794,122 @@ stop_identity() {
 
   # Namespace may still exist if the sandbox didn't clean up on exit
   local ns_name
-  ns_name="ns-$(_identity_hash "$name" 6)"
+  ns_name="ns-$(_identity_hash "$name")"
   if ip netns list 2>/dev/null | grep -q "^${ns_name}[[:space:]]"; then
     local pids
     mapfile -t pids < <(sudo ip netns pids "$ns_name" 2>/dev/null || true)
     if [[ ${#pids[@]} -gt 0 ]]; then
       sudo kill -TERM "${pids[@]}" 2>/dev/null || true
-      sleep 0.5
+      sleep "$SIGTERM_WAIT"
       sudo kill -KILL "${pids[@]}" 2>/dev/null || true
     fi
     sudo ip netns delete "$ns_name" 2>/dev/null || true
   fi
 
   local veth_host
-  veth_host="vh-$(_identity_hash "$name" 6)"
+  veth_host="vh-$(_identity_hash "$name")"
   sudo ip link delete "$veth_host" 2>/dev/null || true
 
   log "Identity '$name' stopped."
+  audit_log "Identity stopped successfully: $name"
 }
 
 show_version() {
   printf '%s version %s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
+  exit "$EXIT_OK"
+}
+
+show_config() {
+  log "=== Current Configuration ==="
+  if [[ -n "$CONFIG_FILE" ]]; then
+    log "Config file: $CONFIG_FILE"
+    if [[ -r "$CONFIG_FILE" ]]; then
+      log "Config file contents:"
+      while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$line" ]] && continue
+        log "  $line"
+      done < "$CONFIG_FILE"
+    else
+      warn "Config file exists but is not readable"
+    fi
+  else
+    log "Config file: Not found (checked ~/.sandboxrc and \$XDG_CONFIG_HOME/sandbox/config)"
+  fi
+  log ""
+  log "Current effective settings:"
+  log "  Identity: ${IDENTITY:-<not set>}"
+  log "  DNS Server: $DNS_SERVER"
+  log "  SOCKS Port: $SOCKS_PORT"
+  log "  Timeout: $TIMEOUT"
+  log "  Verbose: $VERBOSE_ENABLED"
+  log "  GUI Enabled: true"
+  log "  No Sandbox: $NO_SANDBOX"
+  log "  Trace: $TRACE_ENABLED"
+  log "  Dry Run: $DRY_RUN"
+  exit "$EXIT_OK"
+}
+
+cleanup_all_stale() {
+  log "=== Cleaning up stale resources ==="
+  local identity_root="$REAL_HOME/.sandbox_identities"
+
+  # Clean up stale temp files
+  log "Cleaning stale temp files..."
+  local config_dir
+  if [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
+    config_dir="$XDG_CONFIG_HOME/sandbox"
+  else
+    config_dir="$HOME/.config/sandbox"
+  fi
+  cleanup_stale_temps "$config_dir"
+
+  # Clean up stale network namespaces and veth interfaces
+  log "Cleaning stale network namespaces..."
+  local ns_list
+  ns_list="$(ip netns list 2>/dev/null || true)"
+  if [[ -n "$ns_list" ]]; then
+    while IFS= read -r ns; do
+      [[ "$ns" =~ ^ns- ]] || continue
+      log "  Cleaning namespace: $ns"
+      local pids
+      mapfile -t pids < <(sudo ip netns pids "$ns" 2>/dev/null || true)
+      if [[ ${#pids[@]} -gt 0 ]]; then
+        sudo kill -TERM "${pids[@]}" 2>/dev/null || true
+        sleep 0.5
+        sudo kill -KILL "${pids[@]}" 2>/dev/null || true
+      fi
+      sudo ip netns delete "$ns" 2>/dev/null || true
+    done <<< "$ns_list"
+  fi
+
+  # Clean up stale veth interfaces
+  log "Cleaning stale veth interfaces..."
+  local veth_list
+  veth_list="$(ip link show 2>/dev/null | grep -oE 'vh-[a-f0-9]{6}' || true)"
+  if [[ -n "$veth_list" ]]; then
+    while IFS= read -r veth; do
+      [[ "$veth" =~ ^vh- ]] || continue
+      log "  Cleaning veth interface: $veth"
+      sudo ip link delete "$veth" 2>/dev/null || true
+    done <<< "$veth_list"
+  fi
+
+  # Clean up stale PID files
+  log "Cleaning stale PID files..."
+  if [[ -d "$identity_root" ]]; then
+    for pid_file in "$identity_root"/*/.sandbox.pid; do
+      [[ -f "$pid_file" ]] || continue
+      local pid
+      pid="$(<"$pid_file")"
+      if ! is_sandbox_pid "$pid"; then
+        log "  Removing stale PID file: $pid_file"
+        rm -f -- "$pid_file"
+      fi
+    done
+  fi
+
+  log "=== Cleanup complete ==="
   exit "$EXIT_OK"
 }
 
@@ -455,21 +928,28 @@ Options:
   -d, --dns <ip>           Upstream DNS resolver IP (Default: $DEFAULT_DNS_SERVER)
   -t, --timeout <seconds>  Kill sandbox after N seconds (0 = no timeout, Default: 0)
   -n, --no-sandbox         Disable Firejail filesystem/app sandboxing (Network namespace only)
-  --gui                    Enable GUI support (X11 & Wayland forwarding)
   --verbose                Enable detailed step-by-step logging (also shows dir sizes in --list)
+  --log-level <level>      Set logging level: debug, info, warn, error (default: info)
   --trace                  Enable shell tracing (set -x) for debugging
+  --progress               Show progress indicators for long operations
+  --audit                  Enable audit logging for security-relevant operations
   --dry-run                Show proposed topology and profile without altering system
   --force                  Skip confirmation prompts (--delete only)
   --list                   List all existing identities and their state
   --status                 Show running sandbox instances
   --stop <name>            Stop a running sandbox instance
   --delete <name>          Delete an identity and all its persistent state
+  --export <name>          Export an identity to a tarball archive
+  --import <archive>       Import an identity from a tarball archive
+  --clone <src> <dst>      Clone an existing identity to a new name
+  --show-config            Show current configuration (file + command line)
+  --cleanup-only           Clean up stale resources without launching anything
   -v, --version            Show version information
   -h, --help               Show help menu
 
 Examples:
   # Launch Trae as 'Account 1' (Persistent login, spoofed hardware):
-  $SCRIPT_NAME -i trae-acc1 --gui -w ~/.agents -- /usr/share/trae/trae --no-sandbox
+  $SCRIPT_NAME -i trae-acc1 -w ~/.agents -- /usr/share/trae/trae --no-sandbox
 
   # Run a CLI agent with isolated persistent state:
   $SCRIPT_NAME -i qoder_astral -w ~/.agents -- qodercli
@@ -488,6 +968,18 @@ Examples:
 
   # Force delete without confirmation:
   $SCRIPT_NAME --delete trae-acc1 --force
+
+  # Show current configuration:
+  $SCRIPT_NAME --show-config
+
+  # Enable shell completion (bash):
+  source sandbox-completion.bash  # or add to ~/.bashrc
+
+  # Enable shell completion (zsh):
+  source sandbox-completion.zsh    # or add to ~/.zshrc
+
+  # Enable shell completion (fish):
+  source sandbox-completion.fish   # or add to ~/.config/fish/completions/sandbox.fish
 =================================================================
 EOF
   exit "$EXIT_OK"
@@ -518,14 +1010,32 @@ check_platform() {
 
 check_sudo() {
   verbose "Performing sudo pre-flight check..."
-  command -v sudo >/dev/null 2>&1 || error "sudo command is missing." "$EXIT_PERMISSION"
+  command -v sudo >/dev/null 2>&1 || error "sudo command is missing." "$EXIT_PERMISSION" "Install sudo using your package manager."
 
   # Fail early if the user can't sudo, rather than mid-setup when ip netns fails
   local sudo_check
   sudo_check="$(sudo -n -l 2>&1 || true)"
   if [[ "$sudo_check" == *"not allowed"* || "$sudo_check" == *"not in the sudoers"* ]]; then
-    error "Sudo pre-flight check failed: User '$REAL_USER' lacks sudo privileges." "$EXIT_PERMISSION"
+    error "Sudo pre-flight check failed: User '$REAL_USER' lacks sudo privileges." "$EXIT_PERMISSION" "Configure sudo privileges in /etc/sudoers or ask your system administrator."
   fi
+}
+
+# Wrapper for sudo operations with timeout handling
+sudo_with_timeout() {
+  local timeout="${1:-30}" shift
+  local sudo_cmd=(timeout -s TERM "$timeout" sudo "$@")
+
+  verbose "Executing sudo command with ${timeout}s timeout: ${sudo_cmd[*]}"
+  "${sudo_cmd[@]}"
+  local exit_code=$?
+
+  if ((exit_code == 124)); then
+    error "Sudo command timed out after ${timeout}s: ${*}" "$EXIT_GENERAL" "Try increasing the timeout or check if the command is hanging."
+  elif ((exit_code != 0)); then
+    error "Sudo command failed with exit code $exit_code: ${*}" "$EXIT_GENERAL"
+  fi
+
+  return 0
 }
 
 parse_args() {
@@ -533,7 +1043,6 @@ parse_args() {
   WHITELIST_INPUT=""
   SOCKS_PORT="$DEFAULT_SOCKS_PORT"
   USER_PROFILE=""
-  GUI_ENABLED=false
   ACTION="run"
   DELETE_TARGET=""
   STOP_TARGET=""
@@ -570,20 +1079,36 @@ parse_args() {
       TIMEOUT="$2"
       shift 2
       ;;
-    --gui)
-      GUI_ENABLED=true
-      shift
-      ;;
     -n | --no-sandbox)
       NO_SANDBOX=true
       shift
       ;;
     --verbose)
       VERBOSE_ENABLED=true
+      CURRENT_LOG_LEVEL=$LOG_LEVEL_DEBUG
       shift
+      ;;
+    --log-level)
+      [[ -n "${2:-}" ]] || error "Option $1 requires an argument."
+      case "$2" in
+        debug) CURRENT_LOG_LEVEL=$LOG_LEVEL_DEBUG ;;
+        info) CURRENT_LOG_LEVEL=$LOG_LEVEL_INFO ;;
+        warn) CURRENT_LOG_LEVEL=$LOG_LEVEL_WARN ;;
+        error) CURRENT_LOG_LEVEL=$LOG_LEVEL_ERROR ;;
+        *) error "Invalid log level: $2. Must be debug, info, warn, or error." "$EXIT_USAGE" ;;
+      esac
+      shift 2
       ;;
     --trace)
       TRACE_ENABLED=true
+      shift
+      ;;
+    --progress)
+      PROGRESS_ENABLED=true
+      shift
+      ;;
+    --audit)
+      AUDIT_ENABLED=true
       shift
       ;;
     --dry-run)
@@ -613,6 +1138,34 @@ parse_args() {
       ACTION="delete"
       DELETE_TARGET="$2"
       shift 2
+      ;;
+    --export)
+      [[ -n "${2:-}" ]] || error "Option $1 requires an argument."
+      ACTION="export"
+      EXPORT_TARGET="$2"
+      shift 2
+      ;;
+    --import)
+      [[ -n "${2:-}" ]] || error "Option $1 requires an argument."
+      ACTION="import"
+      IMPORT_TARGET="$2"
+      shift 2
+      ;;
+    --clone)
+      [[ -n "${2:-}" ]] || error "Option $1 requires source identity name."
+      [[ -n "${3:-}" ]] || error "Option $1 requires target identity name."
+      ACTION="clone"
+      CLONE_SOURCE="$2"
+      CLONE_TARGET="$3"
+      shift 3
+      ;;
+    --show-config)
+      ACTION="show_config"
+      shift
+      ;;
+    --cleanup-only)
+      ACTION="cleanup_only"
+      shift
       ;;
     -v | --version) show_version ;;
     -h | --help) show_help ;;
@@ -653,6 +1206,35 @@ validate_inputs() {
 
   [[ "$TIMEOUT" =~ ^[0-9]+$ ]] ||
     error "Invalid timeout value: '$TIMEOUT'. Must be a non-negative integer." "$EXIT_USAGE"
+
+  # Validate whitelist paths if provided
+  if [[ -n "$WHITELIST_INPUT" ]]; then
+    local IFS=','
+    local inject_pattern='[;&|\\$()]'
+    for path in $WHITELIST_INPUT; do
+      # Check for path traversal attempts
+      if [[ "$path" =~ \.\. ]]; then
+        error "Invalid whitelist path: '$path' contains parent directory references (..)" "$EXIT_USAGE"
+      fi
+      # Check for shell injection attempts
+      if [[ "$path" =~ $inject_pattern ]]; then
+        error "Invalid whitelist path: '$path' contains shell metacharacters" "$EXIT_USAGE"
+      fi
+    done
+  fi
+
+  # Validate user profile if provided
+  if [[ -n "$USER_PROFILE" ]]; then
+    # Check for path traversal attempts
+    if [[ "$USER_PROFILE" =~ \.\. ]]; then
+      error "Invalid profile path: contains parent directory references (..)" "$EXIT_USAGE"
+    fi
+    # Check for shell injection attempts
+    local inject_pattern='[;&|\\$()]'
+    if [[ "$USER_PROFILE" =~ $inject_pattern ]]; then
+      error "Invalid profile path: contains shell metacharacters" "$EXIT_USAGE"
+    fi
+  fi
 }
 
 check_deps() {
@@ -660,11 +1242,11 @@ check_deps() {
   local missing=()
   local cmd
   for cmd in firejail socat tun2socks ip python3 md5sum realpath flock ss; do
-    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    has_command "$cmd" || missing+=("$cmd")
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
     suggest_install_command "${missing[@]}"
-    error "Missing required dependencies: ${missing[*]}" "$EXIT_MISSING_DEPS"
+    error "Missing required dependencies: ${missing[*]}" "$EXIT_MISSING_DEPS" "Run the suggested install command above, or install missing packages manually."
   fi
 }
 
@@ -679,7 +1261,7 @@ generate_hardware_ids() {
   hash="${hash%% *}"
   _CACHED_HASH="$hash"
 
-  local short_hash="${hash:0:6}"
+  local short_hash="${hash:0:$IDENTITY_HASH_LENGTH}"
   # Locally-administered unicast MAC: bit 1 of octet 0 set (02:xx), bit 0 clear
   local mac_addr="02:${hash:2:2}:${hash:4:2}:${hash:6:2}:${hash:8:2}:${hash:10:2}"
   # Map first byte to a 1-254 range so it works as a valid IPv4 octet
@@ -689,8 +1271,8 @@ generate_hardware_ids() {
   NS_NAME="ns-$short_hash"
   VETH_HOST="vh-$short_hash"
   VETH_NS="vn-$short_hash"
-  PROXY_IP="10.250.$octet.1"
-  NS_IP="10.250.$octet.2"
+  PROXY_IP="$PROXY_NETWORK_BASE.$octet.1"
+  NS_IP="$PROXY_NETWORK_BASE.$octet.2"
   SOCKS_PROXY="socks5://$PROXY_IP:$SOCKS_PORT"
 }
 
@@ -777,11 +1359,7 @@ EOF
   )"
 
   # GUI mode needs X11 shared memory; headless mode locks down IPC and GPU
-  if [[ "$GUI_ENABLED" == true ]]; then
-    PROFILE_CONTENT+=$'\nwhitelist /tmp/.X11-unix'
-  else
-    PROFILE_CONTENT+=$'\nipc-namespace\nnodbus\nnosound\nno3d'
-  fi
+  PROFILE_CONTENT+=$'\nwhitelist /tmp/.X11-unix'
 }
 
 show_dry_run() {
@@ -897,6 +1475,7 @@ PYEOF
 
 setup_network() {
   log "Initializing hardware-spoofed network for identity [$IDENTITY]..."
+  start_progress "Setting up network"
 
   # Pre-delete any leftover namespace/veth from a previous crash.
   # Without this, 'ip netns add' fails with "File exists" on stale state.
@@ -933,11 +1512,14 @@ setup_network() {
   sudo ip netns exec "$NS_NAME" ip tuntap add dev tun0 mode tun
   sudo ip netns exec "$NS_NAME" ip link set tun0 up
   sudo ip netns exec "$NS_NAME" ip route add default dev tun0
+
+  stop_progress
 }
 
 start_proxies() {
   # socat bridges the namespace's tun2socks to the host's SOCKS5 proxy.
   # It binds to the host-side veth IP so only the namespace can reach it.
+  start_progress "Starting proxy redirectors"
   verbose "Starting socat proxy redirector on port $SOCKS_PORT..."
   socat TCP-LISTEN:"$SOCKS_PORT",bind="$PROXY_IP",fork,reuseaddr TCP:127.0.0.1:"$SOCKS_PORT" >/dev/null 2>&1 &
   SOCAT_PID=$!
@@ -947,6 +1529,7 @@ start_proxies() {
   sudo ip netns exec "$NS_NAME" tun2socks -device tun0 -proxy "$SOCKS_PROXY" >/dev/null 2>&1 &
   TUN_PID=$!
   kill -0 "$TUN_PID" 2>/dev/null || error "tun2socks failed to start."
+  stop_progress
 }
 
 wait_for_network() {
@@ -1110,15 +1693,13 @@ execute_sandbox() {
   [[ -n "${TERM_PROGRAM:-}" ]] && env_args+=("TERM_PROGRAM=$TERM_PROGRAM")
   [[ -n "${VTE_VERSION:-}" ]] && env_args+=("VTE_VERSION=$VTE_VERSION")
 
-  if [[ "$GUI_ENABLED" == true ]]; then
-    [[ -n "${DISPLAY:-}" ]] && env_args+=("DISPLAY=$DISPLAY")
-    [[ -n "${WAYLAND_DISPLAY:-}" ]] && env_args+=("WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
-    if [[ -n "${XAUTHORITY:-}" ]]; then
-      env_args+=("XAUTHORITY=$XAUTHORITY")
-      WHITELIST_ARGS+=("--whitelist=$XAUTHORITY")
-    fi
-    [[ -n "${XDG_RUNTIME_DIR:-}" ]] && env_args+=("XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR")
+  [[ -n "${DISPLAY:-}" ]] && env_args+=("DISPLAY=$DISPLAY")
+  [[ -n "${WAYLAND_DISPLAY:-}" ]] && env_args+=("WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
+  if [[ -n "${XAUTHORITY:-}" ]]; then
+    env_args+=("XAUTHORITY=$XAUTHORITY")
+    WHITELIST_ARGS+=("--whitelist=$XAUTHORITY")
   fi
+  [[ -n "${XDG_RUNTIME_DIR:-}" ]] && env_args+=("XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR")
 
   # timeout wraps firejail so the entire sandbox is killed after N seconds,
   # including all child processes. --kill-after ensures SIGKILL if SIGTERM is ignored.
@@ -1169,7 +1750,14 @@ main() {
   check_platform
   check_sudo
 
+  # Load config file before parse_args so command line can override config
+  load_config_file
+
   parse_args "$@"
+
+  # Initialize audit logging if enabled
+  init_audit_log
+  audit_log "Script started: $SCRIPT_NAME version $SCRIPT_VERSION"
 
   # Management actions exit early and don't create namespaces or proxies,
   # so they don't need the cleanup trap.
@@ -1190,15 +1778,34 @@ main() {
     delete_identity "$DELETE_TARGET"
     exit "$EXIT_OK"
     ;;
+  export)
+    export_identity "$EXPORT_TARGET"
+    exit "$EXIT_OK"
+    ;;
+  import)
+    import_identity "$IMPORT_TARGET"
+    exit "$EXIT_OK"
+    ;;
+  clone)
+    clone_identity "$CLONE_SOURCE" "$CLONE_TARGET"
+    exit "$EXIT_OK"
+    ;;
+  show_config)
+    show_config
+    exit "$EXIT_OK"
+    ;;
+  cleanup_only)
+    cleanup_all_stale
+    exit "$EXIT_OK"
+    ;;
   esac
 
   # COMMAND_ARGS is populated in parse_args so it contains only the command
   # arguments after option parsing and shifts.
   [[ ${#COMMAND_ARGS[@]} -gt 0 ]] || error "No command specified to run. Use -- for the command, e.g.: $SCRIPT_NAME -i myid -- firefox" "$EXIT_USAGE"
 
-  # Trap is set after management actions so cleanup only runs when we have
-  # actual state (namespace, veth, proxies) to tear down.
-  trap cleanup EXIT INT TERM
+  # Exit trap for normal cleanup - runs when script exits normally
+  trap cleanup EXIT
 
   validate_inputs
   check_deps
@@ -1215,7 +1822,7 @@ main() {
     # Before giving up, check if the lock holder is actually alive. A crashed
     # previous run may have left the lock file without releasing it.
     recover_stale_instance "$IDENTITY_ROOT" "$IDENTITY"
-    flock -n "$LOCK_FD" || error "Another sandbox instance for identity '$IDENTITY' is already running." "$EXIT_LOCK_CONFLICT"
+    flock -n "$LOCK_FD" || error "Another sandbox instance for identity '$IDENTITY' is already running." "$EXIT_LOCK_CONFLICT" "Use --stop $IDENTITY to stop the running instance, or --cleanup-only to clean up stale resources."
   fi
 
   # Check for port conflicts before setting up the network. Escaping dots in
@@ -1224,7 +1831,7 @@ main() {
   # (e.g., port 1080 matching 10808).
   local escaped_ip="${PROXY_IP//./\.}"
   if ss -tln 2>/dev/null | grep -qE "(${escaped_ip}|0\.0\.0\.0|\[::\]|\*):${SOCKS_PORT} "; then
-    error "Port $SOCKS_PORT is already in use. Choose a different port with -p." "$EXIT_PORT_CONFLICT"
+    error "Port $SOCKS_PORT is already in use." "$EXIT_PORT_CONFLICT" "Try a different port with -p, or stop the process using port $SOCKS_PORT."
   fi
 
   # Resolve the firejail profile with the command name passed explicitly.

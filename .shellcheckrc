@@ -1,0 +1,22 @@
+# ShellCheck configuration for sandbox.sh
+# Disable specific warnings that are acceptable for this script
+
+# Disable SC2155 (declare and assign separately) for some readonly declarations
+# We use inline declarations for brevity in some cases
+exclude=SC2155
+
+# Additional excludes can be added as needed:
+# SC2034: Variable appears unused (we have some global state variables)
+# SC1090: Can't follow non-constant source (for dynamic sourcing)
+# SC2086: Quote to prevent word splitting (we handle this carefully)
+# SC2164: Use 'cd ... || exit' (we have error handling)
+
+# Enable more checks
+# Add severity levels (info, style, warning, error)
+severity=style
+
+# Shell flavor (bash)
+shell=bash
+
+# Check sourced scripts
+external-sources=true
