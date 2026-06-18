@@ -1,0 +1,17 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Build output
+cloakid
+
+# Configs and secrets
+config.json
+config_gpt.json
+proxy_links.txt
+dns_resolvers.txt
+*.env
+.env
