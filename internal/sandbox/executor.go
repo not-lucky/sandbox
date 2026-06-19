@@ -41,19 +41,10 @@ func applyElectronWorkarounds(args []string, cmdBase string) []string {
 	return append(args, "--no-sandbox")
 }
 
-func Execute(opts ExecuteOptions) error {
-	cmdName := opts.CommandArgs[0]
-	cmdBase := filepath.Base(cmdName)
-
-	if !opts.NoSandbox {
-		opts.CommandArgs = applyElectronWorkarounds(opts.CommandArgs, cmdBase)
-	}
-
-	pidFile := filepath.Join(opts.IdentityRoot, ".cloakid.pid")
-	realHome, _ := os.UserHomeDir()
-	realUser := os.Getenv("USER")
-
+func buildEnvArgs(opts ExecuteOptions, realHome, realUser string) ([]string, []string) {
 	var envArgs []string
+	var extraWhitelist []string
+
 	if opts.NoSandbox {
 		envArgs = []string{
 			"HOME=" + realHome,
@@ -64,15 +55,6 @@ func Execute(opts ExecuteOptions) error {
 			"COLORTERM=" + os.Getenv("COLORTERM"),
 			"LANG=" + os.Getenv("LANG"),
 			"SHELL=/bin/bash",
-		}
-		if d := os.Getenv("DISPLAY"); d != "" {
-			envArgs = append(envArgs, "DISPLAY="+d)
-		}
-		if d := os.Getenv("WAYLAND_DISPLAY"); d != "" {
-			envArgs = append(envArgs, "WAYLAND_DISPLAY="+d)
-		}
-		if d := os.Getenv("XAUTHORITY"); d != "" {
-			envArgs = append(envArgs, "XAUTHORITY="+d)
 		}
 	} else {
 		envArgs = []string{
@@ -89,20 +71,37 @@ func Execute(opts ExecuteOptions) error {
 			"SHELL=/bin/bash",
 			"PATH=" + realHome + "/.local/bin:/usr/local/bin:/usr/bin:/bin",
 		}
-		if d := os.Getenv("DISPLAY"); d != "" {
-			envArgs = append(envArgs, "DISPLAY="+d)
-		}
-		if d := os.Getenv("WAYLAND_DISPLAY"); d != "" {
-			envArgs = append(envArgs, "WAYLAND_DISPLAY="+d)
-		}
-		if d := os.Getenv("XAUTHORITY"); d != "" {
-			envArgs = append(envArgs, "XAUTHORITY="+d)
-			opts.Whitelist = append(opts.Whitelist, "--whitelist="+d)
-		}
 		if d := os.Getenv("XDG_RUNTIME_DIR"); d != "" {
 			envArgs = append(envArgs, "XDG_RUNTIME_DIR="+d)
 		}
 	}
+
+	// Common display envs
+	if d := os.Getenv("DISPLAY"); d != "" {
+		envArgs = append(envArgs, "DISPLAY="+d)
+	}
+	if d := os.Getenv("WAYLAND_DISPLAY"); d != "" {
+		envArgs = append(envArgs, "WAYLAND_DISPLAY="+d)
+	}
+	if d := os.Getenv("XAUTHORITY"); d != "" {
+		envArgs = append(envArgs, "XAUTHORITY="+d)
+		if !opts.NoSandbox {
+			extraWhitelist = append(extraWhitelist, "--whitelist="+d)
+		}
+	}
+
+	return envArgs, extraWhitelist
+}
+
+func buildCommandArgs(opts *ExecuteOptions, realHome, realUser string) []string {
+	cmdBase := filepath.Base(opts.CommandArgs[0])
+
+	if !opts.NoSandbox {
+		opts.CommandArgs = applyElectronWorkarounds(opts.CommandArgs, cmdBase)
+	}
+
+	envArgs, extraWhitelist := buildEnvArgs(*opts, realHome, realUser)
+	opts.Whitelist = append(opts.Whitelist, extraWhitelist...)
 
 	var timeoutArgs []string
 	if opts.Timeout > 0 {
@@ -132,7 +131,15 @@ func Execute(opts ExecuteOptions) error {
 		finalArgs = firejailArgs
 	}
 
-	cmdArgs := append(baseArgs, finalArgs...)
+	return append(baseArgs, finalArgs...)
+}
+
+func Execute(opts ExecuteOptions) error {
+	realHome, _ := os.UserHomeDir()
+	realUser := os.Getenv("USER")
+
+	cmdArgs := buildCommandArgs(&opts, realHome, realUser)
+	
 	cmd := exec.Command("sudo", cmdArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -142,7 +149,7 @@ func Execute(opts ExecuteOptions) error {
 		return fmt.Errorf("failed to start sandbox: %w", err)
 	}
 
-	// Write PID file
+	pidFile := filepath.Join(opts.IdentityRoot, ".cloakid.pid")
 	os.WriteFile(pidFile, []byte(strconv.Itoa(cmd.Process.Pid)), 0644)
 	defer os.Remove(pidFile)
 

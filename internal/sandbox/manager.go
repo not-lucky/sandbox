@@ -53,100 +53,66 @@ func checkPortConflict(proxyIP string, port int) error {
 	return nil
 }
 
-func (m *Manager) Run(ctx context.Context, args []string) error {
-	identity.EnsureDirs(m.Identity)
-	hwCfg := netns.GenerateHardwareConfig(m.Identity, m.SocksPort)
-
-	if !m.DryRun {
-		if err := checkPortConflict(hwCfg.ProxyIP, m.SocksPort); err != nil {
-			return err
-		}
-	}
-
+func (m *Manager) acquireLock(hwCfg netns.HardwareConfig) (*os.File, error) {
 	identityDir := identity.GetIdentityPath(m.Identity)
 	lockFilePath := filepath.Join(identityDir, ".lock")
 	lockFile, err := os.OpenFile(lockFilePath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return fmt.Errorf("failed to open lock file: %w", err)
+		return nil, fmt.Errorf("failed to open lock file: %w", err)
 	}
-	defer lockFile.Close()
 
-	if !m.DryRun {
-		err = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-		if err != nil {
-			pidFile := identity.GetPIDFile(m.Identity)
-			if pidBytes, rErr := os.ReadFile(pidFile); rErr == nil {
-				if pid, pErr := strconv.Atoi(strings.TrimSpace(string(pidBytes))); pErr == nil {
-					if identity.IsSandboxPID(pid) {
-						return fmt.Errorf("another sandbox instance for identity '%s' is already running", m.Identity)
-					}
+	err = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err != nil {
+		pidFile := identity.GetPIDFile(m.Identity)
+		if pidBytes, rErr := os.ReadFile(pidFile); rErr == nil {
+			if pid, pErr := strconv.Atoi(strings.TrimSpace(string(pidBytes))); pErr == nil {
+				if identity.IsSandboxPID(pid) {
+					lockFile.Close()
+					return nil, fmt.Errorf("another sandbox instance for identity '%s' is already running", m.Identity)
 				}
 			}
-			logging.Warn("Found stale lock for identity '%s'. Recovering...", m.Identity)
-			netns.TeardownNetwork(hwCfg)
-
-			err = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-			if err != nil {
-				return fmt.Errorf("another sandbox instance for identity '%s' is already running (failed lock retry)", m.Identity)
-			}
 		}
-		defer func() {
-			syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
-		}()
-	}
-
-	profName := ResolveProfile(args[0], m.Profile)
-	profContent := BuildProfileContent(m.Identity, profName)
-	profPath := filepath.Join(identity.GetIdentityConfigs(m.Identity), "sandbox.profile")
-
-	realHome, _ := os.UserHomeDir()
-	fakeHome := identity.GetIdentityHome(m.Identity)
-	cwd, _ := os.Getwd()
-
-	if m.DryRun {
-		fmt.Println("=== DRY RUN MODE: No system-altering commands will be executed ===")
-		fmt.Println("Proposed Namespace Topology:")
-		fmt.Printf("  Namespace Name:      %s\n", hwCfg.NSName)
-		fmt.Printf("  Veth Host Interface: %s (IP: %s/24)\n", hwCfg.VethHost, hwCfg.ProxyIP)
-		fmt.Printf("  Veth NS Interface:   %s (IP: %s/24, Spoofed MAC: %s)\n", hwCfg.VethNS, hwCfg.NSIP, hwCfg.MACAddr)
-		fmt.Println("  Tunnel Interface:    tun0 (Route: default)")
-		fmt.Printf("  Upstream Proxy:      socks5://%s:%d\n", hwCfg.ProxyIP, hwCfg.SocksPort)
-		fmt.Printf("  Upstream DNS:        %s\n", m.DNS)
-		fmt.Printf("  State Home Directory: %s\n", fakeHome)
-		fmt.Println("  Machine ID:          Spoofed (Random)")
-		if m.Timeout > 0 {
-			fmt.Printf("  Timeout:             %ds\n", m.Timeout)
-		}
-		fmt.Println("Proposed Firejail Profile:")
-		fmt.Println("--------------------------------------------------------")
-		fmt.Print(profContent)
-		fmt.Println("--------------------------------------------------------")
-		fmt.Println("Proposed Whitelist Mounts:")
-		fmt.Printf("  Identity root: %s\n", identity.GetIdentityPath(m.Identity))
-		fmt.Printf("  Working dir:   %s\n", cwd)
-		if m.Whitelist != "" {
-			for _, w := range strings.Split(m.Whitelist, ",") {
-				fmt.Printf("  User whitelist: %s\n", w)
-			}
-		}
-		return nil
-	}
-
-	WriteProfile(profPath, profContent)
-
-	logging.Info("Setting up network for identity: %s", m.Identity)
-	if err := netns.SetupNetwork(hwCfg); err != nil {
-		return fmt.Errorf("network setup failed: %w", err)
-	}
-
-	defer func() {
-		logging.Info("Cleaning up network for identity: %s", m.Identity)
+		logging.Warn("Found stale lock for identity '%s'. Recovering...", m.Identity)
 		netns.TeardownNetwork(hwCfg)
-	}()
 
-	processCtx, cancelProcess := context.WithCancel(ctx)
-	defer cancelProcess()
+		err = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err != nil {
+			lockFile.Close()
+			return nil, fmt.Errorf("another sandbox instance for identity '%s' is already running (failed lock retry)", m.Identity)
+		}
+	}
+	return lockFile, nil
+}
 
+func (m *Manager) printDryRunTopology(hwCfg netns.HardwareConfig, profContent, cwd, fakeHome string) {
+	fmt.Println("=== DRY RUN MODE: No system-altering commands will be executed ===")
+	fmt.Println("Proposed Namespace Topology:")
+	fmt.Printf("  Namespace Name:      %s\n", hwCfg.NSName)
+	fmt.Printf("  Veth Host Interface: %s (IP: %s/24)\n", hwCfg.VethHost, hwCfg.ProxyIP)
+	fmt.Printf("  Veth NS Interface:   %s (IP: %s/24, Spoofed MAC: %s)\n", hwCfg.VethNS, hwCfg.NSIP, hwCfg.MACAddr)
+	fmt.Println("  Tunnel Interface:    tun0 (Route: default)")
+	fmt.Printf("  Upstream Proxy:      socks5://%s:%d\n", hwCfg.ProxyIP, hwCfg.SocksPort)
+	fmt.Printf("  Upstream DNS:        %s\n", m.DNS)
+	fmt.Printf("  State Home Directory: %s\n", fakeHome)
+	fmt.Println("  Machine ID:          Spoofed (Random)")
+	if m.Timeout > 0 {
+		fmt.Printf("  Timeout:             %ds\n", m.Timeout)
+	}
+	fmt.Println("Proposed Firejail Profile:")
+	fmt.Println("--------------------------------------------------------")
+	fmt.Print(profContent)
+	fmt.Println("--------------------------------------------------------")
+	fmt.Println("Proposed Whitelist Mounts:")
+	fmt.Printf("  Identity root: %s\n", identity.GetIdentityPath(m.Identity))
+	fmt.Printf("  Working dir:   %s\n", cwd)
+	if m.Whitelist != "" {
+		for _, w := range strings.Split(m.Whitelist, ",") {
+			fmt.Printf("  User whitelist: %s\n", w)
+		}
+	}
+}
+
+func (m *Manager) setupSignalHandler(cancelProcess context.CancelFunc, hwCfg netns.HardwareConfig) {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -156,28 +122,30 @@ func (m *Manager) Run(ctx context.Context, args []string) error {
 			cancelProcess()
 			netns.TeardownNetwork(hwCfg)
 			os.Exit(1)
-		case <-processCtx.Done():
-			return
 		}
 	}()
-	defer signal.Stop(sigs)
+}
 
-	_, err = proxy.StartSocat(processCtx, hwCfg.ProxyIP, hwCfg.SocksPort)
+func (m *Manager) startProxies(ctx context.Context, hwCfg netns.HardwareConfig) error {
+	_, err := proxy.StartSocat(ctx, hwCfg.ProxyIP, hwCfg.SocksPort)
 	if err != nil {
 		return fmt.Errorf("failed to start socat: %w", err)
 	}
 
-	_, err = proxy.StartTun2Socks(processCtx, hwCfg.NSName, hwCfg.ProxyIP, hwCfg.SocksPort)
+	_, err = proxy.StartTun2Socks(ctx, hwCfg.NSName, hwCfg.ProxyIP, hwCfg.SocksPort)
 	if err != nil {
 		return fmt.Errorf("failed to start tun2socks: %w", err)
 	}
 
 	exePath, _ := os.Executable()
-	dnsCmd := exec.CommandContext(processCtx, "sudo", "ip", "netns", "exec", hwCfg.NSName, exePath, "dns-proxy", m.DNS)
+	dnsCmd := exec.CommandContext(ctx, "sudo", "ip", "netns", "exec", hwCfg.NSName, exePath, "dns-proxy", m.DNS)
 	if err := dnsCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start dns proxy: %w", err)
 	}
+	return nil
+}
 
+func (m *Manager) buildWhitelist(fakeHome, realHome, cwd, cmdPath string) []string {
 	var whitelistArgs []string
 	addWhitelistMount := func(hostPath string) {
 		if _, err := os.Stat(hostPath); os.IsNotExist(err) {
@@ -199,10 +167,6 @@ func (m *Manager) Run(ctx context.Context, args []string) error {
 	whitelistArgs = append(whitelistArgs, "--whitelist="+identity.GetIdentitiesRoot())
 	addWhitelistMount(cwd)
 
-	cmdPath, _ := exec.LookPath(args[0])
-	if cmdPath == "" {
-		cmdPath = args[0]
-	}
 	if filepath.IsAbs(cmdPath) && strings.HasPrefix(cmdPath, realHome) {
 		addWhitelistMount(cmdPath)
 	}
@@ -221,6 +185,70 @@ func (m *Manager) Run(ctx context.Context, args []string) error {
 			addWhitelistMount(w)
 		}
 	}
+	return whitelistArgs
+}
+
+func (m *Manager) Run(ctx context.Context, args []string) error {
+	identity.EnsureDirs(m.Identity)
+	hwCfg := netns.GenerateHardwareConfig(m.Identity, m.SocksPort)
+
+	if !m.DryRun {
+		if err := checkPortConflict(hwCfg.ProxyIP, m.SocksPort); err != nil {
+			return err
+		}
+	}
+
+	if !m.DryRun {
+		lockFile, err := m.acquireLock(hwCfg)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+			lockFile.Close()
+		}()
+	}
+
+	profName := ResolveProfile(args[0], m.Profile)
+	profContent := BuildProfileContent(m.Identity, profName)
+	profPath := filepath.Join(identity.GetIdentityConfigs(m.Identity), "sandbox.profile")
+
+	realHome, _ := os.UserHomeDir()
+	fakeHome := identity.GetIdentityHome(m.Identity)
+	cwd, _ := os.Getwd()
+
+	if m.DryRun {
+		m.printDryRunTopology(hwCfg, profContent, cwd, fakeHome)
+		return nil
+	}
+
+	WriteProfile(profPath, profContent)
+
+	logging.Info("Setting up network for identity: %s", m.Identity)
+	if err := netns.SetupNetwork(hwCfg); err != nil {
+		return fmt.Errorf("network setup failed: %w", err)
+	}
+
+	defer func() {
+		logging.Info("Cleaning up network for identity: %s", m.Identity)
+		netns.TeardownNetwork(hwCfg)
+	}()
+
+	processCtx, cancelProcess := context.WithCancel(ctx)
+	defer cancelProcess()
+
+	m.setupSignalHandler(cancelProcess, hwCfg)
+
+	if err := m.startProxies(processCtx, hwCfg); err != nil {
+		return err
+	}
+
+	cmdPath, _ := exec.LookPath(args[0])
+	if cmdPath == "" {
+		cmdPath = args[0]
+	}
+
+	whitelistArgs := m.buildWhitelist(fakeHome, realHome, cwd, cmdPath)
 
 	opts := ExecuteOptions{
 		NSName:       hwCfg.NSName,
@@ -235,7 +263,7 @@ func (m *Manager) Run(ctx context.Context, args []string) error {
 		Cwd:          cwd,
 	}
 
-	err = Execute(opts)
+	err := Execute(opts)
 	if err != nil {
 		return fmt.Errorf("execution failed: %w", err)
 	}
