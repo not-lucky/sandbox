@@ -222,7 +222,8 @@ func (m *Manager) Run(ctx context.Context, args []string) error {
 	}
 
 	profName := ResolveProfile(args[0], m.Profile)
-	profContent := BuildProfileContent(m.Identity, profName)
+	cmdBase := filepath.Base(args[0])
+	profContent := BuildProfileContent(m.Identity, profName, cmdBase)
 	profPath := filepath.Join(identity.GetIdentityConfigs(m.Identity), "sandbox.profile")
 
 	realHome, _ := os.UserHomeDir()

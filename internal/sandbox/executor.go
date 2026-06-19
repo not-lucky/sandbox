@@ -28,6 +28,11 @@ var electronApps = map[string]bool{
 	"codium": true, "cursor": true, "obsidian": true,
 }
 
+var firefoxApps = map[string]bool{
+	"firefox": true, "firefox-esr": true, "mullvadbrowser": true,
+	"librewolf": true, "waterfox": true,
+}
+
 func applyElectronWorkarounds(args []string, cmdBase string) []string {
 	if !electronApps[cmdBase] {
 		return args
@@ -41,9 +46,27 @@ func applyElectronWorkarounds(args []string, cmdBase string) []string {
 	return append(args, "--no-sandbox")
 }
 
+func applyFirefoxWorkarounds(cmdBase string) []string {
+	if !firefoxApps[cmdBase] {
+		return nil
+	}
+	logging.Info("Detecting Firefox-based application [%s]. Setting MOZ_DISABLE_*_SANDBOX environment variables.", cmdBase)
+	return []string{
+		"MOZ_DISABLE_CONTENT_SANDBOX=1",
+		"MOZ_DISABLE_GMP_SANDBOX=1",
+		"MOZ_DISABLE_RDD_SANDBOX=1",
+		"MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1",
+	}
+}
+
 func buildEnvArgs(opts ExecuteOptions, realHome, realUser string) ([]string, []string) {
 	var envArgs []string
 	var extraWhitelist []string
+
+	cmdBase := ""
+	if len(opts.CommandArgs) > 0 {
+		cmdBase = filepath.Base(opts.CommandArgs[0])
+	}
 
 	if opts.NoSandbox {
 		envArgs = []string{
@@ -56,6 +79,8 @@ func buildEnvArgs(opts ExecuteOptions, realHome, realUser string) ([]string, []s
 			"LANG=" + os.Getenv("LANG"),
 			"SHELL=/bin/bash",
 		}
+		firefoxEnv := applyFirefoxWorkarounds(cmdBase)
+		envArgs = append(envArgs, firefoxEnv...)
 	} else {
 		envArgs = []string{
 			"HOME=" + opts.HomeDir,
@@ -74,6 +99,8 @@ func buildEnvArgs(opts ExecuteOptions, realHome, realUser string) ([]string, []s
 		if d := os.Getenv("XDG_RUNTIME_DIR"); d != "" {
 			envArgs = append(envArgs, "XDG_RUNTIME_DIR="+d)
 		}
+		firefoxEnv := applyFirefoxWorkarounds(cmdBase)
+		envArgs = append(envArgs, firefoxEnv...)
 	}
 
 	// Common display envs
@@ -139,7 +166,7 @@ func Execute(opts ExecuteOptions) error {
 	realUser := os.Getenv("USER")
 
 	cmdArgs := buildCommandArgs(&opts, realHome, realUser)
-	
+
 	cmd := exec.Command("sudo", cmdArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

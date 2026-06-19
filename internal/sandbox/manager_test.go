@@ -24,7 +24,7 @@ func TestBuildWhitelist(t *testing.T) {
 	// 2. CWD
 	// 3. cmdPath (because it's absolute and in realHome)
 	// 4. /custom/path
-	
+
 	// Just ensure it returns a slice, we can't fully test file existence
 	// checks without mocking the filesystem, but we ensure it doesn't panic
 	if len(whitelistArgs) == 0 {
@@ -32,7 +32,7 @@ func TestBuildWhitelist(t *testing.T) {
 		// But in unit test environment, stat will fail and they won't be added
 		// EXCEPT identity root which is added unconditionally!
 	}
-	
+
 	foundRoot := false
 	for _, arg := range whitelistArgs {
 		if arg == "--whitelist="+filepath.Join("/tmp", "cloakid-test") { // depends on getIdentitiesRoot

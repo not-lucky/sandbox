@@ -43,6 +43,59 @@ func TestApplyElectronWorkarounds(t *testing.T) {
 	}
 }
 
+func TestApplyFirefoxWorkarounds(t *testing.T) {
+	tests := []struct {
+		name     string
+		cmdBase  string
+		expected []string
+	}{
+		{
+			name:     "Non-firefox app",
+			cmdBase:  "vim",
+			expected: nil,
+		},
+		{
+			name:    "Firefox app",
+			cmdBase: "firefox",
+			expected: []string{
+				"MOZ_DISABLE_CONTENT_SANDBOX=1",
+				"MOZ_DISABLE_GMP_SANDBOX=1",
+				"MOZ_DISABLE_RDD_SANDBOX=1",
+				"MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1",
+			},
+		},
+		{
+			name:    "Mullvad Browser",
+			cmdBase: "mullvadbrowser",
+			expected: []string{
+				"MOZ_DISABLE_CONTENT_SANDBOX=1",
+				"MOZ_DISABLE_GMP_SANDBOX=1",
+				"MOZ_DISABLE_RDD_SANDBOX=1",
+				"MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1",
+			},
+		},
+		{
+			name:    "LibreWolf",
+			cmdBase: "librewolf",
+			expected: []string{
+				"MOZ_DISABLE_CONTENT_SANDBOX=1",
+				"MOZ_DISABLE_GMP_SANDBOX=1",
+				"MOZ_DISABLE_RDD_SANDBOX=1",
+				"MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := applyFirefoxWorkarounds(tt.cmdBase)
+			if !reflect.DeepEqual(result, tt.expected) {
+				t.Errorf("Expected %v, got %v", tt.expected, result)
+			}
+		})
+	}
+}
+
 func TestBuildEnvArgs(t *testing.T) {
 	opts := ExecuteOptions{
 		NoSandbox: false,
@@ -77,11 +130,11 @@ func TestBuildEnvArgs(t *testing.T) {
 			}
 		}
 	}
-	
+
 	if !hasUser {
 		t.Errorf("USER env var missing in nosandbox mode")
 	}
-	
+
 	// Avoid unused variable compiler error if tests run in an env without XAUTHORITY
-	_ = extraWhitelist 
+	_ = extraWhitelist
 }
