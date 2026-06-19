@@ -136,6 +136,36 @@ CloakID keeps all state for an identity in `~/.cloakid_identities/<identity>`. Y
     cloakid clone <source_identity> <target_identity>
     ```
 
+### Managing Command Aliases / Shortcuts
+
+You can save long, complex `cloakid` commands as short aliases so you don't have to type out the whole command every time:
+
+*   **Add an alias:**
+    ```bash
+    cloakid alias add <alias_name> <command_args...>
+    ```
+    *Example:*
+    ```bash
+    cloakid alias add mullvad run -i my-identity -w ~/.agents,~/.skills -f mullvad-browser -- /opt/mullvad-browser/mullvadbrowser --no-sandbox
+    ```
+*   **Run a saved alias:**
+    Simply call the alias name directly:
+    ```bash
+    cloakid <alias_name>
+    ```
+    *Example:*
+    ```bash
+    cloakid mullvad
+    ```
+*   **List all saved aliases:**
+    ```bash
+    cloakid alias list
+    ```
+*   **Remove an alias:**
+    ```bash
+    cloakid alias remove <alias_name>
+    ```
+
 ### Maintenance
 
 If an application crashes violently or the host machine loses power, you may be left with stale network namespaces or `veth` interfaces. You can easily wipe all lingering network state:

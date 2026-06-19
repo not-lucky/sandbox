@@ -30,6 +30,30 @@ var dnsProxyCmd = &cobra.Command{
 }
 
 func Execute() {
+	if len(os.Args) > 1 {
+		firstArg := os.Args[1]
+		isSub := false
+		for _, c := range rootCmd.Commands() {
+			if c.Name() == firstArg || c.HasAlias(firstArg) {
+				isSub = true
+				break
+			}
+		}
+		if !isSub && firstArg != "--help" && firstArg != "-h" && firstArg != "help" {
+			if tempCfg, err := config.LoadConfig(); err == nil && tempCfg != nil {
+				if aliasArgs, exists := tempCfg.Aliases[firstArg]; exists {
+					newArgs := make([]string, 0, len(os.Args)-1+len(aliasArgs))
+					newArgs = append(newArgs, os.Args[0])
+					newArgs = append(newArgs, aliasArgs...)
+					if len(os.Args) > 2 {
+						newArgs = append(newArgs, os.Args[2:]...)
+					}
+					os.Args = newArgs
+				}
+			}
+		}
+	}
+
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
