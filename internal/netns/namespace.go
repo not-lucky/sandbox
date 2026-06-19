@@ -48,6 +48,9 @@ func SetupNetwork(cfg HardwareConfig) error {
 	if err := runSudo("ip", "link", "set", cfg.VethHost, "up"); err != nil {
 		return err
 	}
+	if err := runSudo("iptables", "-I", "INPUT", "-i", cfg.VethHost, "-j", "ACCEPT"); err != nil {
+		return err
+	}
 
 	if err := runSudo("ip", "netns", "exec", cfg.NSName, "ip", "addr", "add", cfg.NSIP+"/24", "dev", cfg.VethNS); err != nil {
 		return err
@@ -88,6 +91,7 @@ func TeardownNetwork(cfg HardwareConfig) {
 			exec.Command("sudo", killArgs...).Run()
 		}
 	}
+	runSudo("iptables", "-D", "INPUT", "-i", cfg.VethHost, "-j", "ACCEPT")
 	runSudo("ip", "netns", "delete", cfg.NSName)
 	runSudo("ip", "link", "delete", cfg.VethHost)
 }

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"cloakid/internal/identity"
 	"cloakid/internal/logging"
@@ -139,8 +140,19 @@ func (m *Manager) startProxies(ctx context.Context, hwCfg netns.HardwareConfig) 
 
 	exePath, _ := os.Executable()
 	dnsCmd := exec.CommandContext(ctx, "sudo", "ip", "netns", "exec", hwCfg.NSName, exePath, "dns-proxy", m.DNS)
+	if logFile, err := os.OpenFile("/tmp/cloakid-dns.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666); err == nil {
+		dnsCmd.Stdout = logFile
+		dnsCmd.Stderr = logFile
+		defer logFile.Close()
+	}
 	if err := dnsCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start dns proxy: %w", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	if err := dnsCmd.Process.Signal(syscall.Signal(0)); err != nil {
+		logContent, _ := os.ReadFile("/tmp/cloakid-dns.log")
+		return fmt.Errorf("dns proxy exited prematurely: %w (log: %s)", err, string(logContent))
 	}
 	return nil
 }
