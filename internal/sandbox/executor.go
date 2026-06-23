@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"cloakid/internal/logging"
 )
@@ -21,6 +22,10 @@ type ExecuteOptions struct {
 	Whitelist    []string
 	IdentityRoot string
 	Cwd          string
+
+	// Quiet routes the inner command's stdout/stderr into a timestamped
+	// file under /tmp instead of the terminal. Stdin is preserved.
+	Quiet bool
 }
 
 var electronApps = map[string]bool{
@@ -31,6 +36,13 @@ var electronApps = map[string]bool{
 var firefoxApps = map[string]bool{
 	"firefox": true, "firefox-esr": true, "mullvadbrowser": true,
 	"librewolf": true, "waterfox": true,
+}
+
+// traeApps lists commands that ship a bundled libstdc++ too old for the
+// system libicuuc (GLIBCXX_3.4.30 not found). For these we prepend the
+// system libstdc++ via LD_LIBRARY_PATH.
+var traeApps = map[string]bool{
+	"trae": true,
 }
 
 func applyElectronWorkarounds(args []string, cmdBase string) []string {
@@ -59,6 +71,14 @@ func applyFirefoxWorkarounds(cmdBase string) []string {
 	}
 }
 
+func applyTraeWorkarounds(cmdBase string) []string {
+	if !traeApps[cmdBase] {
+		return nil
+	}
+	logging.Info("Detecting trae [libstdc++ mismatch]. Prepending /usr/lib to LD_LIBRARY_PATH.")
+	return []string{"LD_LIBRARY_PATH=/usr/lib"}
+}
+
 func buildEnvArgs(opts ExecuteOptions, realHome, realUser string) ([]string, []string) {
 	var envArgs []string
 	var extraWhitelist []string
@@ -81,6 +101,8 @@ func buildEnvArgs(opts ExecuteOptions, realHome, realUser string) ([]string, []s
 		}
 		firefoxEnv := applyFirefoxWorkarounds(cmdBase)
 		envArgs = append(envArgs, firefoxEnv...)
+		traeEnv := applyTraeWorkarounds(cmdBase)
+		envArgs = append(envArgs, traeEnv...)
 	} else {
 		envArgs = []string{
 			"HOME=" + opts.HomeDir,
@@ -101,6 +123,8 @@ func buildEnvArgs(opts ExecuteOptions, realHome, realUser string) ([]string, []s
 		}
 		firefoxEnv := applyFirefoxWorkarounds(cmdBase)
 		envArgs = append(envArgs, firefoxEnv...)
+		traeEnv := applyTraeWorkarounds(cmdBase)
+		envArgs = append(envArgs, traeEnv...)
 	}
 
 	// Common display envs
@@ -168,9 +192,15 @@ func Execute(opts ExecuteOptions) error {
 	cmdArgs := buildCommandArgs(&opts, realHome, realUser)
 
 	cmd := exec.Command("sudo", cmdArgs...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
+
+	// Close the quiet log file on every return path; cmd.Start() may fail.
+	if opts.Quiet {
+		defer func() {
+			if f, ok := cmd.Stdout.(*os.File); ok {
+				_ = f.Close()
+			}
+		}()
+	}
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start sandbox: %w", err)
@@ -181,4 +211,32 @@ func Execute(opts ExecuteOptions) error {
 	defer os.Remove(pidFile)
 
 	return cmd.Wait()
+}
+
+// configureStreams wires the child's stdio. When quiet is true, both
+// stdout and stderr are routed to a fresh timestamped log file under /tmp
+// (one file per run); stdin is always preserved so interactive prompts
+// still work. When quiet is false, all three streams pass through to the
+// terminal unchanged.
+func configureStreams(cmd *exec.Cmd, identity string, quiet bool) error {
+	cmd.Stdin = os.Stdin
+	if !quiet {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return nil
+	}
+	path := quietLogPath(identity, time.Now())
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("quiet mode: open log file: %w", err)
+	}
+	cmd.Stdout = f
+	cmd.Stderr = f
+	logging.Info("Quiet mode: child output -> %s", path)
+	return nil
+}
+
+// quietLogPath builds the per-run timestamped log file path used by --quiet.
+func quietLogPath(identity string, now time.Time) string {
+	return fmt.Sprintf("/tmp/cloakid-quiet-%s-%s.log", identity, now.Format("20060102-150405"))
 }

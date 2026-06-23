@@ -5,19 +5,23 @@ import (
 	"fmt"
 
 	"cloakid/internal/logging"
+	"cloakid/internal/proxy"
 	"cloakid/internal/sandbox"
 	"github.com/spf13/cobra"
 )
 
 var (
-	runIdentity  string
-	runWhitelist string
-	runSocksPort int
-	runProfile   string
-	runDNS       string
-	runTimeout   int
-	runNoSandbox bool
-	runDryRun    bool
+	runIdentity   string
+	runWhitelist  string
+	runSocksPort  int
+	runProfile    string
+	runDNS        string
+	runTimeout    int
+	runNoSandbox  bool
+	runDryRun     bool
+	runForward    string
+	runForwardAll bool
+	runQuiet      bool
 )
 
 var runCmd = &cobra.Command{
@@ -50,15 +54,23 @@ var runCmd = &cobra.Command{
 			noSandbox = true
 		}
 
+		mappings, err := resolveForwardMappings(runForward, runForwardAll)
+		if err != nil {
+			return err
+		}
+
 		manager := &sandbox.Manager{
-			Identity:  runIdentity,
-			SocksPort: runSocksPort,
-			DNS:       runDNS,
-			Timeout:   runTimeout,
-			NoSandbox: noSandbox,
-			Profile:   runProfile,
-			Whitelist: runWhitelist,
-			DryRun:    runDryRun,
+			Identity:        runIdentity,
+			SocksPort:       runSocksPort,
+			DNS:             runDNS,
+			Timeout:         runTimeout,
+			NoSandbox:       noSandbox,
+			Profile:         runProfile,
+			Whitelist:       runWhitelist,
+			DryRun:          runDryRun,
+			ForwardMappings: mappings,
+			ForwardAll:      runForwardAll,
+			Quiet:           runQuiet,
 		}
 
 		ctx := context.Background()
@@ -76,4 +88,17 @@ func init() {
 	runCmd.Flags().IntVarP(&runTimeout, "timeout", "t", 0, "Timeout in seconds")
 	runCmd.Flags().BoolVarP(&runNoSandbox, "no-sandbox", "n", false, "Disable firejail")
 	runCmd.Flags().BoolVar(&runDryRun, "dry-run", false, "Dry run mode")
+	runCmd.Flags().StringVar(&runForward, "forward", "", "Comma-separated host:namespace port mappings (e.g. 8080:80,9090:9090). A bare port like '38085' forwards host:38085 -> namespace:38085.")
+	runCmd.Flags().BoolVar(&runForwardAll, "forward-all", false, "Auto-forward every TCP port the namespace apps listen on")
+	runCmd.Flags().BoolVarP(&runQuiet, "quiet", "q", false, "Silence the inner command; tee its output to /tmp/cloakid-quiet-<identity>-<timestamp>.log")
+}
+
+// resolveForwardMappings validates the --forward / --forward-all combination
+// and parses the mapping string. Both flags set is a configuration error;
+// either alone is valid (empty forward with forwardAll unset is also valid).
+func resolveForwardMappings(forward string, forwardAll bool) ([]proxy.PortMapping, error) {
+	if forward != "" && forwardAll {
+		return nil, fmt.Errorf("--forward and --forward-all are mutually exclusive")
+	}
+	return proxy.ParsePortMappings(forward)
 }

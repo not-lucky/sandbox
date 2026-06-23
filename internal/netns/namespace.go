@@ -61,8 +61,22 @@ func SetupNetwork(cfg HardwareConfig) error {
 	if err := runSudo("ip", "netns", "exec", cfg.NSName, "ip", "link", "set", "lo", "up"); err != nil {
 		return err
 	}
+	if err := runSudo("ip", "netns", "exec", cfg.NSName, "sysctl", "-w", "net.ipv4.ping_group_range=0 2147483647"); err != nil {
+		return err
+	}
 
 	if err := runSudo("ip", "netns", "exec", cfg.NSName, "ip", "tuntap", "add", "dev", "tun0", "mode", "tun"); err != nil {
+		return err
+	}
+	// tun2socks relays raw IP packets read from the tun0 fd to the upstream
+	// SOCKS5 proxy. Without a routable IPv4 address on tun0, the kernel
+	// can't pick a source address for outbound IPv4 packets (default route
+	// points at tun0) and tools that print the interface list — e.g. Node's
+	// os.networkInterfaces() inside Trae — see tun0 with only an IPv6
+	// link-local, which Trae interprets as "no network" and bails out
+	// before completing OAuth. A /32 keeps the address off any subnet
+	// route and avoids collision with the 10.250.x.0/24 used by the veth.
+	if err := runSudo("ip", "netns", "exec", cfg.NSName, "ip", "addr", "add", "10.255.255.1/32", "dev", "tun0"); err != nil {
 		return err
 	}
 	if err := runSudo("ip", "netns", "exec", cfg.NSName, "ip", "link", "set", "tun0", "up"); err != nil {

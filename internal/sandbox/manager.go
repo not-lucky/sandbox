@@ -27,6 +27,21 @@ type Manager struct {
 	Profile   string
 	Whitelist string
 	DryRun    bool
+
+	// ForwardMappings is the explicit list of host->namespace port mappings
+	// (from --forward). When non-empty and ForwardAll is false, each mapping
+	// gets a dedicated socat forwarder at sandbox startup.
+	ForwardMappings []proxy.PortMapping
+
+	// ForwardAll enables the AutoForwarder goroutine which mirrors every
+	// TCP port the namespace apps start listening on to the host loopback.
+	// Mutually exclusive with ForwardMappings.
+	ForwardAll bool
+
+	// Quiet silences the inner command's stdout/stderr by routing them to
+	// a timestamped log file under /tmp. CloakID's own logging output is
+	// unaffected. Stdin stays attached so interactive prompts still work.
+	Quiet bool
 }
 
 func checkPortConflict(proxyIP string, port int) error {
@@ -111,6 +126,19 @@ func (m *Manager) printDryRunTopology(hwCfg netns.HardwareConfig, profContent, c
 			fmt.Printf("  User whitelist: %s\n", w)
 		}
 	}
+	fmt.Println("Proposed Port Forwarding:")
+	if m.ForwardAll {
+		fmt.Println("  Mode: all TCP ports the namespace apps listen on (mirrored to host 127.0.0.1)")
+	} else if len(m.ForwardMappings) > 0 {
+		for _, pm := range m.ForwardMappings {
+			fmt.Printf("  host 127.0.0.1:%d -> namespace 127.0.0.1:%d\n", pm.HostPort, pm.NSPort)
+		}
+	} else {
+		fmt.Println("  (none)")
+	}
+	if m.Quiet {
+		fmt.Println("Quiet: child stdout/stderr -> /tmp/cloakid-quiet-<identity>-<timestamp>.log")
+	}
 }
 
 func (m *Manager) setupSignalHandler(cancelProcess context.CancelFunc, hwCfg netns.HardwareConfig) {
@@ -153,6 +181,38 @@ func (m *Manager) startProxies(ctx context.Context, hwCfg netns.HardwareConfig) 
 	if err := dnsCmd.Process.Signal(syscall.Signal(0)); err != nil {
 		logContent, _ := os.ReadFile("/tmp/cloakid-dns.log")
 		return fmt.Errorf("dns proxy exited prematurely: %w (log: %s)", err, string(logContent))
+	}
+	return nil
+}
+
+// startForwarders wires port forwarding based on the Manager configuration.
+// Either ForwardMappings (explicit list) or ForwardAll (auto-discover every
+// TCP port the namespace apps listen on) is honoured, never both.
+func (m *Manager) startForwarders(ctx context.Context, hwCfg netns.HardwareConfig) error {
+	if m.ForwardAll {
+		if len(m.ForwardMappings) > 0 {
+			return fmt.Errorf("internal error: ForwardAll and ForwardMappings are mutually exclusive")
+		}
+		af := proxy.NewAutoForwarder(ctx, hwCfg.NSName, hwCfg.SocksPort)
+		af.Start()
+		logging.Info("AutoForwarder enabled: every TCP port the namespace apps listen on will be mirrored to host 127.0.0.1")
+		return nil
+	}
+
+	if len(m.ForwardMappings) == 0 {
+		return nil
+	}
+
+	// Forwarders are spawned with exec.CommandContext(ctx, …) inside
+	// proxy.StartPortForwarding, so processCtx cancellation on shutdown
+	// tears them down cleanly. No additional tracking or kill is needed here.
+	for _, pm := range m.ForwardMappings {
+		if err := checkPortConflict("127.0.0.1", pm.HostPort); err != nil {
+			return fmt.Errorf("cannot forward host port %d: %w", pm.HostPort, err)
+		}
+		if _, err := proxy.StartPortForwarding(ctx, hwCfg.NSName, pm.HostPort, pm.NSPort); err != nil {
+			return fmt.Errorf("failed to start forwarder for host:%d -> ns:%d: %w", pm.HostPort, pm.NSPort, err)
+		}
 	}
 	return nil
 }
@@ -256,6 +316,10 @@ func (m *Manager) Run(ctx context.Context, args []string) error {
 		return err
 	}
 
+	if err := m.startForwarders(processCtx, hwCfg); err != nil {
+		return err
+	}
+
 	cmdPath, _ := exec.LookPath(args[0])
 	if cmdPath == "" {
 		cmdPath = args[0]
@@ -274,6 +338,7 @@ func (m *Manager) Run(ctx context.Context, args []string) error {
 		Whitelist:    whitelistArgs,
 		IdentityRoot: identity.GetIdentityPath(m.Identity),
 		Cwd:          cwd,
+		Quiet:        m.Quiet,
 	}
 
 	err := Execute(opts)

@@ -58,6 +58,7 @@ private-etc %s
 read-only /sbin
 read-only /usr/sbin
 read-only /bin
+read-only /usr/local/bin
 read-only /usr/bin
 whitelist /tmp/.X11-unix
 `, identity, includeLine, identity, seccompBlock, etcList)

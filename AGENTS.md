@@ -2,6 +2,9 @@
 
 > CloakID — identity-based secure workspace manager. Linux-only.
 
+For any file search or grep in the current git-indexed directory, use fff tools.
+
+
 ## Project Overview
 
 CloakID runs any process inside a fully isolated environment composed of three layers: a Linux **network namespace** (`ns-<hash>`), a **veth pair + TUN + tun2socks** chain that forces every TCP/UDP packet through a host-side **SOCKS5 proxy**, and an optional **Firejail** filesystem sandbox. Each named identity (e.g. `accountA`) gets:
