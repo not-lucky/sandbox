@@ -14,6 +14,7 @@ type Config struct {
 	DefaultTimeout   int                 `yaml:"default_timeout"`
 	Verbose          bool                `yaml:"verbose"`
 	NoSandbox        bool                `yaml:"no_sandbox"`
+	NoProxy          bool                `yaml:"no_proxy"`
 	Aliases          map[string][]string `yaml:"aliases,omitempty"`
 }
 

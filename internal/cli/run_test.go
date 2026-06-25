@@ -18,8 +18,8 @@ func TestResolveForwardMappings(t *testing.T) {
 		errSubstr  string
 	}{
 		{
-			name:    "empty / no auto",
-			want:    nil,
+			name: "empty / no auto",
+			want: nil,
 		},
 		{
 			name:    "single port",
@@ -32,9 +32,9 @@ func TestResolveForwardMappings(t *testing.T) {
 			want:    []proxy.PortMapping{{HostPort: 8080, NSPort: 80}},
 		},
 		{
-			name:    "auto only",
+			name:       "auto only",
 			forwardAll: true,
-			want:    nil,
+			want:       nil,
 		},
 		{
 			name:       "both flags set is rejected",

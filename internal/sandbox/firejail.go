@@ -5,7 +5,7 @@ import (
 	"os"
 )
 
-func BuildProfileContent(identity, nativeProfile, cmdName string) string {
+func BuildProfileContent(identity, nativeProfile, cmdName string, noProxy bool) string {
 	includeLine := ""
 	etcList := "resolv.conf,hosts,ssl,ca-certificates,pki,crypto-policies"
 
@@ -32,6 +32,11 @@ nonewprivs
 noroot`
 	}
 
+	dnsLine := "\n# Route DNS\ndns 127.0.0.1\n"
+	if noProxy {
+		dnsLine = ""
+	}
+
 	content := fmt.Sprintf(`# Dynamic Security Profile for Identity: %s
 %s
 
@@ -47,10 +52,7 @@ blacklist /sys/class/firmware
 nogroups
 caps.drop all
 %s
-
-# Route DNS
-dns 127.0.0.1
-
+%s
 private-dev
 private-tmp
 private-etc %s
@@ -61,7 +63,7 @@ read-only /bin
 read-only /usr/local/bin
 read-only /usr/bin
 whitelist /tmp/.X11-unix
-`, identity, includeLine, identity, seccompBlock, etcList)
+`, identity, includeLine, identity, seccompBlock, dnsLine, etcList)
 
 	return content
 }

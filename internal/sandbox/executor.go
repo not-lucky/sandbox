@@ -16,6 +16,7 @@ type ExecuteOptions struct {
 	Identity     string
 	HomeDir      string
 	NoSandbox    bool
+	NoProxy      bool
 	Timeout      int
 	CommandArgs  []string
 	ProfilePath  string
@@ -159,7 +160,12 @@ func buildCommandArgs(opts *ExecuteOptions, realHome, realUser string) []string 
 		timeoutArgs = []string{"timeout", "--signal=TERM", "--kill-after=5", strconv.Itoa(opts.Timeout)}
 	}
 
-	baseArgs := []string{"ip", "netns", "exec", opts.NSName, "sudo", "-u", realUser, "env", "-i"}
+	var baseArgs []string
+	if opts.NoProxy {
+		baseArgs = []string{"-u", realUser, "env", "-i"}
+	} else {
+		baseArgs = []string{"ip", "netns", "exec", opts.NSName, "sudo", "-u", realUser, "env", "-i"}
+	}
 	baseArgs = append(baseArgs, envArgs...)
 	baseArgs = append(baseArgs, timeoutArgs...)
 
@@ -192,6 +198,10 @@ func Execute(opts ExecuteOptions) error {
 	cmdArgs := buildCommandArgs(&opts, realHome, realUser)
 
 	cmd := exec.Command("sudo", cmdArgs...)
+
+	if err := configureStreams(cmd, opts.Identity, opts.Quiet); err != nil {
+		return err
+	}
 
 	// Close the quiet log file on every return path; cmd.Start() may fail.
 	if opts.Quiet {

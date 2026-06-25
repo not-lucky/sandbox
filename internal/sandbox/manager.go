@@ -24,6 +24,7 @@ type Manager struct {
 	DNS       string
 	Timeout   int
 	NoSandbox bool
+	NoProxy   bool
 	Profile   string
 	Whitelist string
 	DryRun    bool
@@ -264,7 +265,7 @@ func (m *Manager) Run(ctx context.Context, args []string) error {
 	identity.EnsureDirs(m.Identity)
 	hwCfg := netns.GenerateHardwareConfig(m.Identity, m.SocksPort)
 
-	if !m.DryRun {
+	if !m.DryRun && !m.NoProxy {
 		if err := checkPortConflict(hwCfg.ProxyIP, m.SocksPort); err != nil {
 			return err
 		}
@@ -283,7 +284,7 @@ func (m *Manager) Run(ctx context.Context, args []string) error {
 
 	profName := ResolveProfile(args[0], m.Profile)
 	cmdBase := filepath.Base(args[0])
-	profContent := BuildProfileContent(m.Identity, profName, cmdBase)
+	profContent := BuildProfileContent(m.Identity, profName, cmdBase, m.NoProxy)
 	profPath := filepath.Join(identity.GetIdentityConfigs(m.Identity), "sandbox.profile")
 
 	realHome, _ := os.UserHomeDir()
@@ -297,27 +298,31 @@ func (m *Manager) Run(ctx context.Context, args []string) error {
 
 	WriteProfile(profPath, profContent)
 
-	logging.Info("Setting up network for identity: %s", m.Identity)
-	if err := netns.SetupNetwork(hwCfg); err != nil {
-		return fmt.Errorf("network setup failed: %w", err)
-	}
+	if !m.NoProxy {
+		logging.Info("Setting up network for identity: %s", m.Identity)
+		if err := netns.SetupNetwork(hwCfg); err != nil {
+			return fmt.Errorf("network setup failed: %w", err)
+		}
 
-	defer func() {
-		logging.Info("Cleaning up network for identity: %s", m.Identity)
-		netns.TeardownNetwork(hwCfg)
-	}()
+		defer func() {
+			logging.Info("Cleaning up network for identity: %s", m.Identity)
+			netns.TeardownNetwork(hwCfg)
+		}()
+	}
 
 	processCtx, cancelProcess := context.WithCancel(ctx)
 	defer cancelProcess()
 
-	m.setupSignalHandler(cancelProcess, hwCfg)
+	if !m.NoProxy {
+		m.setupSignalHandler(cancelProcess, hwCfg)
 
-	if err := m.startProxies(processCtx, hwCfg); err != nil {
-		return err
-	}
+		if err := m.startProxies(processCtx, hwCfg); err != nil {
+			return err
+		}
 
-	if err := m.startForwarders(processCtx, hwCfg); err != nil {
-		return err
+		if err := m.startForwarders(processCtx, hwCfg); err != nil {
+			return err
+		}
 	}
 
 	cmdPath, _ := exec.LookPath(args[0])
@@ -332,6 +337,7 @@ func (m *Manager) Run(ctx context.Context, args []string) error {
 		Identity:     m.Identity,
 		HomeDir:      fakeHome,
 		NoSandbox:    m.NoSandbox,
+		NoProxy:      m.NoProxy,
 		Timeout:      m.Timeout,
 		CommandArgs:  args,
 		ProfilePath:  profPath,

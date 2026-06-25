@@ -18,6 +18,7 @@ var (
 	runDNS        string
 	runTimeout    int
 	runNoSandbox  bool
+	runNoProxy    bool
 	runDryRun     bool
 	runForward    string
 	runForwardAll bool
@@ -54,6 +55,11 @@ var runCmd = &cobra.Command{
 			noSandbox = true
 		}
 
+		noProxy := runNoProxy
+		if cfg != nil && cfg.NoProxy {
+			noProxy = true
+		}
+
 		mappings, err := resolveForwardMappings(runForward, runForwardAll)
 		if err != nil {
 			return err
@@ -65,6 +71,7 @@ var runCmd = &cobra.Command{
 			DNS:             runDNS,
 			Timeout:         runTimeout,
 			NoSandbox:       noSandbox,
+			NoProxy:         noProxy,
 			Profile:         runProfile,
 			Whitelist:       runWhitelist,
 			DryRun:          runDryRun,
@@ -87,6 +94,7 @@ func init() {
 	runCmd.Flags().StringVarP(&runDNS, "dns", "d", "", "DNS server")
 	runCmd.Flags().IntVarP(&runTimeout, "timeout", "t", 0, "Timeout in seconds")
 	runCmd.Flags().BoolVarP(&runNoSandbox, "no-sandbox", "n", false, "Disable firejail")
+	runCmd.Flags().BoolVar(&runNoProxy, "no-proxy", false, "Disable network namespace and SOCKS proxy (run directly on host network)")
 	runCmd.Flags().BoolVar(&runDryRun, "dry-run", false, "Dry run mode")
 	runCmd.Flags().StringVar(&runForward, "forward", "", "Comma-separated host:namespace port mappings (e.g. 8080:80,9090:9090). A bare port like '38085' forwards host:38085 -> namespace:38085.")
 	runCmd.Flags().BoolVar(&runForwardAll, "forward-all", false, "Auto-forward every TCP port the namespace apps listen on")
